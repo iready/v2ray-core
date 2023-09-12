@@ -95,7 +95,6 @@ func (s *handlerServer) AlterInbound(ctx context.Context, request *AlterInboundR
 	if err != nil {
 		return nil, newError("failed to get handler: ", request.Tag).Base(err)
 	}
-
 	return &AlterInboundResponse{}, operation.ApplyInbound(ctx, handler)
 }
 

@@ -29,7 +29,6 @@ func (b *bindingInstance) startAPIInstance() {
 		App: []*anypb.Any{
 			serial.ToTypedMessage(&instman.Config{}),
 			serial.ToTypedMessage(&commander.Config{
-				Tag: "api",
 				Service: []*anypb.Any{
 					serial.ToTypedMessage(&command.Config{}),
 				},
