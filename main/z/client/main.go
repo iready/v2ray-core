@@ -13,7 +13,7 @@ var (
 	nowVersion  int32  = 0
 	waitSeconds int32  = 15
 	Address     string = "127.0.0.1:49901"
-	Key         string = "liangxian"
+	Key         string = "bba"
 )
 
 // 启动
