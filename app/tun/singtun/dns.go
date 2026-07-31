@@ -16,6 +16,16 @@ const (
 	TunDNSOutboundTag = "dns-out"
 )
 
+var (
+	// FakeDNS 路由常写 /15；/16 池是其子网，Contains 一次即可。
+	fakeDNSRoutePrefix = netip.MustParsePrefix("198.18.0.0/15")
+)
+
+// IsFakeDNSAddr 判断是否落在 FakeDNS 地址池。
+func IsFakeDNSAddr(addr netip.Addr) bool {
+	return addr.IsValid() && addr.Is4() && fakeDNSRoutePrefix.Contains(addr)
+}
+
 // TunInterfaceAddrs 返回 TUN 接口本机地址（DNS 劫持目标），不得走 route_exclude bypass。
 func TunInterfaceAddrs(ipv4Prefixes, ipv6Prefixes []netip.Prefix) []netip.Addr {
 	var addrs []netip.Addr

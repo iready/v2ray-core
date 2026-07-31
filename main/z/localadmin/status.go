@@ -24,36 +24,39 @@ type ServerInstanceStatus struct {
 
 // StatusSnapshot 本地后台状态 API 响应。
 type StatusSnapshot struct {
-	WireConnected bool                   `json:"wire_connected"`
-	TokenVersion  int32                  `json:"token_version"`
-	ServerKeys    []string               `json:"server_keys"`
-	ServerCount   int                    `json:"server_count"`
-	HealthyCount  int                    `json:"healthy_count"`
-	Servers       []ServerInstanceStatus `json:"servers"`
-	LastError     string                 `json:"last_error"`
-	ConnectedAt   string                 `json:"connected_at,omitempty"`
-	StartedAt     string                 `json:"started_at,omitempty"`
-	ConfigPath    string                 `json:"config_path"`
-	AgentReady    bool                   `json:"agent_ready"`
-	AgentPID      int                    `json:"agent_pid"`
-	AdminPort     int                    `json:"admin_port"`
-	Addr          string                 `json:"addr,omitempty"`
-	TunEnabled    bool                   `json:"tun_enabled"`
-	TunHelper     bool                   `json:"tun_helper_installed"`
-	TunIfName     string                 `json:"tun_if_name,omitempty"`
-	TunInConfig   bool                   `json:"tun_in_config"`
-	TunLocalUse   bool                   `json:"tun_local_use"`
-	TunOwnerKey   string                 `json:"tun_owner_key,omitempty"`
-	TunActive     bool                   `json:"tun_active"`
-	TunDegraded   string                 `json:"tun_degraded_reason,omitempty"`
-	TunBindIface  string                 `json:"tun_bind_interface,omitempty"`
-	TunBindAuto   bool                   `json:"tun_bind_auto"`
-	Elevated      bool                   `json:"elevated"`
-	Autostart     bool                   `json:"autostart_installed"`
-	ClientBuild   string                 `json:"client_build,omitempty"`
-	ExePath       string                 `json:"exe_path,omitempty"`
-	OS            string                 `json:"os"`
-	Features      PlatformFeatures       `json:"features"`
+	WireConnected   bool                      `json:"wire_connected"`
+	TokenVersion    int32                     `json:"token_version"`
+	ServerKeys      []string                  `json:"server_keys"`
+	ServerCount     int                       `json:"server_count"`
+	HealthyCount    int                       `json:"healthy_count"`
+	Servers         []ServerInstanceStatus    `json:"servers"`
+	LastError       string                    `json:"last_error"`
+	ConnectedAt     string                    `json:"connected_at,omitempty"`
+	StartedAt       string                    `json:"started_at,omitempty"`
+	ConfigPath      string                    `json:"config_path"`
+	AgentReady      bool                      `json:"agent_ready"`
+	AgentPID        int                       `json:"agent_pid"`
+	AdminPort       int                       `json:"admin_port"`
+	Addr            string                    `json:"addr,omitempty"`
+	TunEnabled      bool                      `json:"tun_enabled"`
+	TunHelper       bool                      `json:"tun_helper_installed"`
+	TunIfName       string                    `json:"tun_if_name,omitempty"`
+	TunInConfig     bool                      `json:"tun_in_config"`
+	TunLocalUse     bool                      `json:"tun_local_use"`
+	TunOwnerKey     string                    `json:"tun_owner_key,omitempty"`
+	TunActive       bool                      `json:"tun_active"`
+	TunDegraded     string                    `json:"tun_degraded_reason,omitempty"`
+	TunHijack       bool                      `json:"tun_hijack"`
+	TunHijackPaused string                    `json:"tun_hijack_paused,omitempty"`
+	TunBindIface    string                    `json:"tun_bind_interface,omitempty"`
+	TunBindAuto     bool                      `json:"tun_bind_auto"`
+	Elevated        bool                      `json:"elevated"`
+	Autostart       bool                      `json:"autostart_installed"`
+	ClientBuild     string                    `json:"client_build,omitempty"`
+	ExePath         string                    `json:"exe_path,omitempty"`
+	OS              string                    `json:"os"`
+	Features        PlatformFeatures          `json:"features"`
+	Outbounds       []rocket.OutboundSnapshot `json:"outbounds"`
 }
 
 // PlatformFeatures 管理后台按本机系统展示的能力开关。
@@ -111,6 +114,7 @@ func BuildStatus(rs *rocket.RS, cfg AgentConfig, rt rvstore.Runtime) StatusSnaps
 		AgentReady:  cfg.IsComplete(),
 		Addr:        cfg.ResolvedAddr(),
 		Servers:     []ServerInstanceStatus{},
+		Outbounds:   []rocket.OutboundSnapshot{},
 		AgentPID:    rt.PID,
 		AdminPort:   rt.AdminPort,
 		Elevated:    tunctl.IsElevated(),
@@ -149,7 +153,17 @@ func BuildStatus(rs *rocket.RS, cfg AgentConfig, rt rvstore.Runtime) StatusSnaps
 	snap.TunOwnerKey = st.TunOwnerKey
 	snap.TunActive = st.TunActive
 	snap.TunDegraded = st.TunDegradedReason
-	snap.TunBindIface = st.TunBindInterface
-	snap.TunBindAuto = st.TunBindAuto
+	snap.TunBindIface = tunctl.CurrentBindInterface()
+	if snap.TunBindIface == "" {
+		snap.TunBindIface = st.TunBindInterface
+	}
+	snap.TunBindAuto = tunctl.BindInterfaceAuto() || st.TunBindAuto
+	hs := tunctl.HijackSnapshotNow()
+	snap.TunHijack = hs.Wanted
+	snap.TunHijackPaused = hs.Paused
+	snap.Outbounds = rocket.RemoteOnly(rocket.ListOutbounds(rs))
+	if snap.Outbounds == nil {
+		snap.Outbounds = []rocket.OutboundSnapshot{}
+	}
 	return snap
 }

@@ -13,12 +13,13 @@ import (
 // Windows：路由与 TUN 适配器 DNS 由 sing-tun AutoRoute 独占（同 sing-box），不改物理网卡 DNS。
 
 type Manager struct {
-	mu         sync.Mutex
-	active     bool
-	ifName     string
-	tunIPv4    string
-	bypassPlan BypassPlan
-	routePlan  RoutePlan
+	mu            sync.Mutex
+	active        bool
+	ifName        string
+	tunIPv4       string
+	bypassPlan    BypassPlan
+	routePlan     RoutePlan
+	routesApplied bool
 }
 
 var defaultManager = &Manager{}
@@ -98,11 +99,14 @@ func (m *Manager) Enable(name string, mtu uint32, tunIPv4 string) error {
 
 func (m *Manager) Disable() error {
 	m.mu.Lock()
+	clearWindowsFakeDNSRoute()
+	clearWindowsTunDefaultRoute(m.tunIPv4)
 	singtun.ResetPlatform()
 	singtun.ClearBypassDecisionCache()
 	m.active = false
 	m.ifName = ""
 	m.tunIPv4 = ""
+	m.routesApplied = false
 	m.mu.Unlock()
 	return nil
 }
@@ -113,27 +117,34 @@ func (m *Manager) ApplyRoutes() error {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.ifName != "" {
-		m.mu.Unlock()
-		return nil
-	}
 	ip := m.tunIPv4
 	if ip == "" {
 		ip = singtun.DefaultTunIPv4
 	}
+	haveName := m.ifName != ""
 	m.mu.Unlock()
 
-	name, _, err := waitInterfaceByIPv4(ip, 20, 100*time.Millisecond)
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	var (
+		name string
+		idx  int
+		err  error
+	)
+	if haveName {
+		name, idx, err = findInterfaceByIPv4(ip)
+	} else {
+		name, idx, err = waitInterfaceByIPv4(ip, 20, 100*time.Millisecond)
+	}
 	if err != nil {
 		return err
 	}
+
+	m.mu.Lock()
 	if m.active {
 		m.ifName = name
+		m.routesApplied = true
 	}
-	return nil
+	m.mu.Unlock()
+	return ensureWindowsFakeDNSRoute(idx, ip)
 }
 
 // ApplyDNS 空操作：TUN 适配器 DNS 由 sing-tun 设置，不改物理网卡。
@@ -141,9 +152,48 @@ func (m *Manager) ApplyDNS() error { return nil }
 
 func (m *Manager) RefreshDNS() error { return nil }
 
-func (m *Manager) SuspendRoutes() error { return nil }
+func (m *Manager) SuspendRoutes() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active {
+		return nil
+	}
+	clearWindowsTunDefaultRoute(m.tunIPv4)
+	clearWindowsFakeDNSRoute()
+	m.routesApplied = false
+	return nil
+}
 
-func (m *Manager) ResumeRoutes() error { return nil }
+func (m *Manager) ResumeRoutes() error {
+	m.mu.Lock()
+	active := m.active
+	applied := m.routesApplied
+	ip := m.tunIPv4
+	m.mu.Unlock()
+	if !active || applied {
+		return nil
+	}
+	if ip == "" {
+		ip = singtun.DefaultTunIPv4
+	}
+	name, idx, err := findInterfaceByIPv4(ip)
+	if err != nil {
+		return err
+	}
+	if err := addWindowsTunDefaultRoute(idx, ip); err != nil {
+		return err
+	}
+	if err := ensureWindowsFakeDNSRoute(idx, ip); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if m.active {
+		m.ifName = name
+		m.routesApplied = true
+	}
+	m.mu.Unlock()
+	return nil
+}
 
 func (m *Manager) PrepareConfigs(rawConfigs []string) error {
 	if userOptedOut() {

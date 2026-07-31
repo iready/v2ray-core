@@ -58,6 +58,7 @@ func StartWithOptions(ctx context.Context, opts stun.Options, stackName string, 
 	}
 	if err := tunIf.Start(); err != nil {
 		_ = tunStack.Close()
+		_ = tunIf.Close()
 		detachInterfaceMonitors()
 		return nil, err
 	}

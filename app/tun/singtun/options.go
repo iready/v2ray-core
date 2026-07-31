@@ -73,13 +73,13 @@ func BuildOptions(input ConfigInput) (stun.Options, string, ConfigInput, []netip
 		Logger:                    nopLogger{},
 	}
 	if len(inet4) > 0 && (autoRoute || platform.ExternalConfiguration || platform.FileDescriptor > 0) {
-		// Windows：只给 TUN 适配器设 DNS=127.0.0.1（sing-tun LUID API），由本机 :53 dokodemo 进 dns-out。
+		// Windows/Linux：系统/resolv DNS=127.0.0.1，由本机 :53 dokodemo 进 dns-out。
 		// Darwin：ExternalConfiguration，DNS 由 helper SET_DNS→127.0.0.1→53535。
-		// Linux：DNS 指 TUN 接口地址，UDP/53 经 tun-in→dns-out。
-		if runtime.GOOS == "windows" {
-			opts.DNSServers = []netip.Addr{netip.AddrFrom4([4]byte{127, 0, 0, 1})}
-		} else {
+		// 注意：Linux 不可把 DNS 指到 TUN 地址本身——对端是本机地址时 UDP 不进 gVisor 劫持路径。
+		if runtime.GOOS == "darwin" {
 			opts.DNSServers = []netip.Addr{TunDNSAddr(inet4)}
+		} else {
+			opts.DNSServers = []netip.Addr{netip.AddrFrom4([4]byte{127, 0, 0, 1})}
 		}
 	}
 

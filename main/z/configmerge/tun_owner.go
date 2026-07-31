@@ -24,6 +24,7 @@ func ApplyTunOwnerPolicy(raw string) (string, error) {
 	ensureTunBlockQUICRule(doc, tunTag)
 	directTag := ensureDirectFreedomOutbound(doc)
 	ensureTunNonCNIPProxyRule(doc, tunTag)
+	ensureTunFakeDNSProxyRule(doc, tunTag)
 	ensureTunFinalDirectRule(doc, tunTag, directTag)
 	ensureBlackholeOutbound(doc)
 	return marshalDoc(doc)
@@ -118,6 +119,8 @@ func ensureTunFinalDirectRule(doc map[string]interface{}, tunTag, directTag stri
 	routing["rules"] = rules
 }
 
+const tunFakeDNSPool = "198.18.0.0/15"
+
 // ensureTunNonCNIPProxyRule 真 IP 访问时域名/嗅探常未命中，geoip:!cn 走代理，避免 Google 等直连空响应。
 func ensureTunNonCNIPProxyRule(doc map[string]interface{}, tunTag string) {
 	proxyTag := preferTUNProxyOutboundTag(doc)
@@ -141,22 +144,88 @@ func ensureTunNonCNIPProxyRule(doc map[string]interface{}, tunTag string) {
 		if asString(rule["outboundTag"]) != proxyTag {
 			continue
 		}
-		if ruleHasIP(rule, "geoip:!cn") {
+		if ruleHasIP(rule, "geoip:!cn") && rule["domain"] == nil && rule["domains"] == nil {
 			return
 		}
 	}
 	insert := map[string]interface{}{
 		"type":        "field",
 		"inboundTag":  []interface{}{tunTag},
-		"ip":          []interface{}{"geoip:!cn", "198.18.0.0/15"},
+		"ip":          []interface{}{"geoip:!cn"},
 		"outboundTag": proxyTag,
 	}
-	if i := indexTunCatchAll(rules, tunTag); i >= 0 {
-		rules = append(rules[:i], append([]interface{}{insert}, rules[i:]...)...)
-	} else {
-		rules = append(rules, insert)
+	routing["rules"] = insertRuleBeforeTunCatchAll(rules, tunTag, insert)
+}
+
+// ensureTunFakeDNSProxyRule FakeDNS 段单独进代理。不能塞进带 domain 的 geoip:!cn 规则：
+// 嗅探未改写时只有 198.18.x，AND 域名条件会失败，流量落到 catch-all direct 黑洞，UI 卡死。
+func ensureTunFakeDNSProxyRule(doc map[string]interface{}, tunTag string) {
+	proxyTag := preferTUNProxyOutboundTag(doc)
+	if proxyTag == "" {
+		return
 	}
-	routing["rules"] = rules
+	routing, _ := doc["routing"].(map[string]interface{})
+	if routing == nil {
+		routing = map[string]interface{}{}
+		doc["routing"] = routing
+	}
+	rules, _ := routing["rules"].([]interface{})
+	if hasTunFakeDNSProxyRule(rules, tunTag, proxyTag) {
+		return
+	}
+	insert := map[string]interface{}{
+		"type":        "field",
+		"inboundTag":  []interface{}{tunTag},
+		"ip":          []interface{}{tunFakeDNSPool},
+		"outboundTag": proxyTag,
+	}
+	routing["rules"] = insertRuleBeforeTunCatchAll(rules, tunTag, insert)
+}
+
+func hasTunFakeDNSProxyRule(rules []interface{}, tunTag, proxyTag string) bool {
+	for _, item := range rules {
+		rule, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if !ruleMatchesInbound(rule, tunTag) {
+			continue
+		}
+		if asString(rule["outboundTag"]) != proxyTag {
+			continue
+		}
+		if rule["domain"] != nil || rule["domains"] != nil {
+			continue
+		}
+		if asString(rule["port"]) != "" || asString(rule["network"]) != "" {
+			continue
+		}
+		if ruleHasIP(rule, tunFakeDNSPool) && ruleIPCount(rule) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func ruleIPCount(rule map[string]interface{}) int {
+	switch v := rule["ip"].(type) {
+	case string:
+		if v == "" {
+			return 0
+		}
+		return 1
+	case []interface{}:
+		return len(v)
+	default:
+		return 0
+	}
+}
+
+func insertRuleBeforeTunCatchAll(rules []interface{}, tunTag string, insert map[string]interface{}) []interface{} {
+	if i := indexTunCatchAll(rules, tunTag); i >= 0 {
+		return append(rules[:i], append([]interface{}{insert}, rules[i:]...)...)
+	}
+	return append(rules, insert)
 }
 
 func indexTunCatchAll(rules []interface{}, tunTag string) int {
@@ -225,6 +294,7 @@ func ensureDefaultTunSniffing(tun map[string]interface{}) {
 		if sniff, ok := tun[key].(map[string]interface{}); ok && sniff != nil {
 			// 强制覆盖目标，避免仅嗅探不改写导致仍按 IP 直连
 			sniff["enabled"] = true
+			sniff["metadataOnly"] = true
 			if sniff["destination_override"] == nil && sniff["destinationOverride"] == nil {
 				sniff["destination_override"] = []interface{}{"fakedns", "http", "tls", "quic"}
 			} else {
@@ -240,6 +310,7 @@ func ensureDefaultTunSniffing(tun map[string]interface{}) {
 	}
 	tun["sniffing_settings"] = map[string]interface{}{
 		"enabled":              true,
+		"metadataOnly":         true,
 		"destination_override": []interface{}{"fakedns", "http", "tls", "quic"},
 	}
 }

@@ -14,8 +14,10 @@ import (
 
 // AgentHooks v2fly_wire 推送回调。
 type AgentHooks struct {
-	OnConfig  func(*pb.GetConfigRes)
-	OnExecute func([]*pb.Execute)
+	OnConfig            func(*pb.GetConfigRes)
+	OnExecute           func([]*pb.Execute)
+	OnDomainRouteStatus func(wire.DomainRouteStatusPush)
+	OnWireReady         func()
 }
 
 func (rs *RS) machineName() string {
@@ -26,35 +28,29 @@ func (rs *RS) machineName() string {
 	return host
 }
 
-// ConnectHello 建连并 hello。
-// TUN 已启用时短暂 SuspendRoutes，避免控制面被 split route 拐进 utun；
-// dial 结束立即 Resume，本地代理在失败退避期间继续可用。
+// ConnectHello 建连并 hello。劫持路由只由 tunctl.WithWireDial 同步，不在这里单独 Suspend/Resume。
 func (rs *RS) ConnectHello(ctx context.Context) (*pb.GetConfigRes, error) {
-	if err := tunctl.SuspendRoutes(); err != nil {
-		log.Printf("suspend TUN routes before wire dial: %v", err)
-	}
-	defer func() {
-		if err := tunctl.ResumeRoutes(); err != nil {
-			log.Printf("resume TUN routes: %v", err)
-		}
-	}()
-
-	rs.disconnectWire()
-	client, err := wire.Dial(rs.Address, rs.Token, rs.Sign, rs.WireTLS)
-	if err != nil {
-		rs.setWireError(err)
-		return nil, err
-	}
-	rs.wireClient = client
-	client.Start()
-	payload, err := client.Hello(ctx, rs.machineName())
-	if err != nil {
+	var payload *pb.GetConfigRes
+	err := tunctl.WithWireDial(func() error {
 		rs.disconnectWire()
-		rs.setWireError(err)
-		return nil, err
-	}
-	rs.setWireConnected(true)
-	return payload.ToGetConfigRes(), nil
+		client, err := wire.Dial(rs.Address, rs.Token, rs.Sign, rs.WireTLS)
+		if err != nil {
+			rs.setWireError(err)
+			return err
+		}
+		rs.wireClient = client
+		client.Start()
+		p, err := client.Hello(ctx, rs.machineName())
+		if err != nil {
+			rs.disconnectWire()
+			rs.setWireError(err)
+			return err
+		}
+		rs.setWireConnected(true)
+		payload = p.ToGetConfigRes()
+		return nil
+	})
+	return payload, err
 }
 
 // Reconnect 断开并重新 hello（供本地后台触发）。
@@ -106,6 +102,26 @@ func (rs *RS) AppliedTokenVersion() int32 {
 	return rs.TokenVersion
 }
 
+// SubmitDomainRouteRequest 经 Wire 上报域名录入申请。
+func (rs *RS) SubmitDomainRouteRequest(ctx context.Context, domains []string, remark, clientReqID string) (string, error) {
+	if rs.wireClient == nil {
+		return "", fmt.Errorf("wire 未连接")
+	}
+	res, err := rs.wireClient.SubmitDomainRouteRequest(ctx, domains, remark, clientReqID)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", fmt.Errorf("empty response")
+	}
+	return res.RequestID, nil
+}
+
+// WireConnected 当前是否持有 Wire 客户端。
+func (rs *RS) WireConnected() bool {
+	return rs.wireClient != nil
+}
+
 // ReloadConfig 停实例、按新配置重启并更新 token 版本。
 // 第二个返回值表示是否实际执行了重载（false 表示版本未变而跳过）。
 func (rs *RS) ReloadConfig(cfg *pb.GetConfigRes) (bool, error) {
@@ -143,7 +159,7 @@ func (rs *RS) ReloadConfig(cfg *pb.GetConfigRes) (bool, error) {
 }
 
 // RunAgent 阻塞：维持 WS 长连接，断线指数退避重连。
-// 本地实例与缓存配置不随 Wire 断开而停；仅 dial 窗口短暂卸 TUN 路由。
+// 本地实例与缓存配置不随 Wire 断开而停。服务端更新掉控制面时保持 TUN。
 func (rs *RS) RunAgent(ctx context.Context, hooks AgentHooks) {
 	backoff := 5 * time.Second
 	const maxBackoff = 2 * time.Minute
@@ -169,6 +185,9 @@ func (rs *RS) RunAgent(ctx context.Context, hooks AgentHooks) {
 			backoff = 5 * time.Second
 			if hooks.OnConfig != nil && cfg != nil {
 				hooks.OnConfig(cfg)
+			}
+			if hooks.OnWireReady != nil {
+				hooks.OnWireReady()
 			}
 		}
 
@@ -200,7 +219,11 @@ func (rs *RS) runWireSession(ctx context.Context, hooks AgentHooks) error {
 			}
 		},
 		hooks.OnExecute,
+		hooks.OnDomainRouteStatus,
 	)
+	if hooks.OnWireReady != nil {
+		hooks.OnWireReady()
+	}
 	client.StartPingLoop(ctx, rs.AppliedTokenVersion)
 	return client.Wait(ctx)
 }

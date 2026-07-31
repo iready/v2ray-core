@@ -10,6 +10,7 @@ type (
 	AgentConfig   = rvstore.Connection
 	TunProfile    = rvstore.TunProfile
 	LogProfile    = rvstore.LogProfile
+	MitmProfile   = rvstore.MitmProfile
 )
 
 // Store 读写 ~/.rv/agent.json connection/runtime 段。
@@ -48,6 +49,14 @@ func (s *Store) LoadLogProfile() (LogProfile, error) {
 
 func (s *Store) SaveLogProfile(profile LogProfile) error {
 	return s.inner.SaveLogProfile(profile)
+}
+
+func (s *Store) LoadMitmProfile() (MitmProfile, error) {
+	return s.inner.LoadMitmProfile()
+}
+
+func (s *Store) SaveMitmProfile(profile MitmProfile) error {
+	return s.inner.SaveMitmProfile(profile)
 }
 
 func (s *Store) LoadRuntime() rvstore.Runtime {

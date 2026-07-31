@@ -13,8 +13,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/v2fly/v2ray-core/v5/main/z/domainreq"
 	"github.com/v2fly/v2ray-core/v5/main/z/localadmin"
 	"github.com/v2fly/v2ray-core/v5/main/z/localconfig"
+	"github.com/v2fly/v2ray-core/v5/main/z/mitmctl"
+	"github.com/v2fly/v2ray-core/v5/main/z/notify"
 	pb "github.com/v2fly/v2ray-core/v5/main/z/proto"
 	"github.com/v2fly/v2ray-core/v5/main/z/regService"
 	"github.com/v2fly/v2ray-core/v5/main/z/rocket"
@@ -65,7 +68,12 @@ func main() {
 	uninstallAutostart := flag.Bool("uninstall-autostart", false, "取消登录自启")
 	dumpConfig := flag.Bool("dump-config", false, "打印服务端下发的 v2fly 配置后退出")
 	dumpConfigView := flag.String("dump-config-view", "all", "与 -dump-config 联用：all | merged | raw | <实例key> | <key>:merged")
+	relaunchWait := flag.Int("relaunch-wait", 0, "内部：等该 PID 退出后再继续")
 	flag.Parse()
+
+	if *relaunchWait > 0 {
+		localadmin.WaitRelaunch(*relaunchWait)
+	}
 
 	if *dumpConfig {
 		if err := runDumpConfig(adminStore, *dumpConfigView); err != nil {
@@ -166,14 +174,17 @@ func main() {
 
 	setupSignal(rt)
 
+	if file, loadErr := adminStore.RVStore().Load(); loadErr == nil {
+		if pid, port, ok := localadmin.ExistingInstance(file.Runtime, *adminPort); ok {
+			msg := fmt.Sprintf("已有实例 PID=%d · 后台 http://127.0.0.1:%d\n本进程退出，请先关掉旧进程再启动", pid, port)
+			log.Print(msg)
+			notify.Info("Rocket 已在运行", msg)
+			return
+		}
+	}
+
 	if *adminMode != "off" {
 		port, ln, err := localadmin.AllocateAdminPort("127.0.0.1", *adminPort, 5)
-		if err != nil {
-			if file, loadErr := adminStore.RVStore().Load(); loadErr == nil {
-				localadmin.KillStaleProcess(file.Runtime.PID)
-				port, ln, err = localadmin.AllocateAdminPort("127.0.0.1", *adminPort, 5)
-			}
-		}
 		if err != nil {
 			log.Fatalf("绑定本地后台端口失败: %v", err)
 		}
@@ -193,6 +204,11 @@ func main() {
 				log.Printf("本地后台退出: %v", err)
 			}
 		}()
+		if file, err := adminStore.RVStore().Load(); err == nil {
+			if err := mitmctl.Default().Apply(file.Mitm); err != nil {
+				log.Printf("MITM 启动失败: %v", err)
+			}
+		}
 	}
 
 	if agentCfg.IsComplete() {
@@ -200,7 +216,9 @@ func main() {
 			log.Printf("agent 启动失败（可在本地后台修改配置）: %v", err)
 		}
 	} else {
-		log.Printf("连接未配置，请打开 http://127.0.0.1:%d 完成设置", rt.adminPort)
+		msg := fmt.Sprintf("本地后台已就绪，请打开 http://127.0.0.1:%d 完成设置", rt.adminPort)
+		log.Print(msg)
+		notify.Info("Rocket", msg)
 	}
 	log.Printf("rocket 运行中 · 本地后台 http://127.0.0.1:%d · 按 Ctrl+C 退出", rt.adminPort)
 
@@ -310,6 +328,7 @@ func (rt *runtime) startAgent() error {
 		rs, err := rt.newRS(cfg)
 		if err != nil {
 			rt.mu.Unlock()
+			notify.Info("Rocket 启动失败", err.Error())
 			return err
 		}
 		rt.rs = rs
@@ -333,11 +352,14 @@ func (rt *runtime) startAgent() error {
 func (rt *runtime) runAgentLoop(rs *rocket.RS) error {
 	serverCfg, err := bootstrapConfig(rt.ctx, rs, rt.store)
 	if err != nil {
+		notify.Info("Rocket 启动失败", err.Error())
 		return err
 	}
 	if err := startServersWithRetry(rt.ctx, rs, serverCfg); err != nil {
+		notify.Info("Rocket 启动失败", err.Error())
 		return err
 	}
+	notify.Info("Rocket 已启动", fmt.Sprintf("本地后台 http://127.0.0.1:%d", rt.adminPort))
 	go rs.RunTUNRecoveryLoop(rt.ctx, serverCfg)
 	rs.RunAgent(rt.ctx, rocket.AgentHooks{
 		OnConfig: func(c *pb.GetConfigRes) {
@@ -359,6 +381,18 @@ func (rt *runtime) runAgentLoop(rs *rocket.RS) error {
 			log.Printf("收到 %d 条远程命令", len(cmds))
 			rs.Execute(rt.ctx, cmds)
 		},
+		OnDomainRouteStatus: func(p wire.DomainRouteStatusPush) {
+			if err := domainreq.ApplyStatusPush(p.RequestID, p.ClientReqID, p.Status, p.RejectReason, p.Added, p.Skipped, p.RouteNames); err != nil {
+				log.Printf("更新域名申请状态失败: %v", err)
+			}
+		},
+		OnWireReady: func() {
+			ctx, cancel := context.WithTimeout(rt.ctx, 30*time.Second)
+			defer cancel()
+			if n, err := domainreq.FlushPending(ctx, rs); n > 0 || err != nil {
+				log.Printf("同步域名录入申请: flushed=%d err=%v", n, err)
+			}
+		},
 	})
 	return nil
 }
@@ -374,8 +408,7 @@ func (rt *runtime) rebootstrap() error {
 	ctx, cancel := context.WithTimeout(rt.ctx, 45*time.Second)
 	defer cancel()
 
-	// 先 hello（ConnectHello 内短暂 SuspendRoutes），旧实例继续代理；
-	// 拿到配置后再停旧启新，避免「等配置时整机像断网」。
+	// 先 hello（WithWireDial 统一同步劫持路由），拿到配置后再停旧启新。
 	serverCfg, err := rs.Reconnect(ctx)
 	if err != nil {
 		return err
@@ -602,6 +635,7 @@ func setupSignal(rt *runtime) {
 		sig := <-ch
 		log.Printf("收到 %v，关闭中...", sig)
 		rt.cancel()
+		_ = mitmctl.Default().Stop()
 		rt.mu.Lock()
 		if rt.rs != nil {
 			rt.rs.StopAllServers()
@@ -609,7 +643,7 @@ func setupSignal(rt *runtime) {
 		}
 		rt.mu.Unlock()
 		// 不在退出路径写 agent.json：部署会 TERM 后很快 KILL，
-		// 旧 WriteFile 截断窗口会留下空文件；残留 runtime.pid 由 KillStaleProcess 判断存活。
+		// 旧 WriteFile 截断窗口会留下空文件；残留 runtime.pid 由 ExistingInstance 判断存活。
 		os.Exit(0)
 	}()
 }

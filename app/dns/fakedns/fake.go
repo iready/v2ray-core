@@ -83,18 +83,9 @@ func (fkdns *Holder) initializeFromConfig() error {
 }
 
 func (fkdns *Holder) initialize(ipPoolCidr string, lruSize int) error {
-	var ipRange *gonet.IPNet
-	var ipaddr gonet.IP
-	var currentIP *big.Int
-	var err error
-
-	if ipaddr, ipRange, err = gonet.ParseCIDR(ipPoolCidr); err != nil {
+	ipaddr, ipRange, err := gonet.ParseCIDR(ipPoolCidr)
+	if err != nil {
 		return newError("Unable to parse CIDR for Fake DNS IP assignment").Base(err).AtError()
-	}
-
-	currentIP = big.NewInt(0).SetBytes(ipaddr)
-	if ipaddr.To4() != nil {
-		currentIP = big.NewInt(0).SetBytes(ipaddr.To4())
 	}
 
 	ones, bits := ipRange.Mask.Size()
@@ -102,11 +93,39 @@ func (fkdns *Holder) initialize(ipPoolCidr string, lruSize int) error {
 	if math.Log2(float64(lruSize)) >= float64(rooms) {
 		return newError("LRU size is bigger than subnet size").AtError()
 	}
+
+	start := nextIPAfterNetwork(ipaddr)
 	fkdns.domainToIP = cache.NewLru(lruSize)
 	fkdns.ipRange = ipRange
-	fkdns.nextIP = currentIP
 	fkdns.mu = new(sync.Mutex)
+	// 跳过网段网络地址（如 198.18.0.0）：部分栈对 *.0 建连会 connection refused。
+	fkdns.nextIP = start
 	return nil
+}
+
+func (fkdns *Holder) rewindNextIP() {
+	fkdns.nextIP = nextIPAfterNetwork(fkdns.ipRange.IP)
+}
+
+func nextIPAfterNetwork(ip gonet.IP) *big.Int {
+	n := ipToBigInt(ip)
+	return n.Add(n, big.NewInt(1))
+}
+
+func ipToBigInt(ip gonet.IP) *big.Int {
+	if ip4 := ip.To4(); ip4 != nil {
+		return big.NewInt(0).SetBytes(ip4)
+	}
+	return big.NewInt(0).SetBytes(ip)
+}
+
+func isUnusableFakeIP(ip net.Address) bool {
+	v4 := ip.IP().To4()
+	if v4 == nil {
+		return false
+	}
+	// 避开网段/广播形态，降低各平台对「非主机地址」的拒绝。
+	return v4[3] == 0 || v4[3] == 255
 }
 
 // GetFakeIPForDomain checks and generate a fake IP for a domain name
@@ -122,9 +141,12 @@ func (fkdns *Holder) GetFakeIPForDomain(domain string) []net.Address {
 
 		fkdns.nextIP = fkdns.nextIP.Add(fkdns.nextIP, big.NewInt(1))
 		if !fkdns.ipRange.Contains(fkdns.nextIP.Bytes()) {
-			fkdns.nextIP = big.NewInt(0).SetBytes(fkdns.ipRange.IP)
+			fkdns.rewindNextIP()
 		}
 
+		if isUnusableFakeIP(ip) {
+			continue
+		}
 		// if we run for a long time, we may go back to beginning and start seeing the IP in use
 		if _, ok := fkdns.domainToIP.GetKeyFromValue(ip); !ok {
 			break

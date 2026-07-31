@@ -1,26 +1,33 @@
 package configmerge
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"runtime"
 	"strings"
 
 	"github.com/v2fly/v2ray-core/v5/app/tun/singtun"
+	"github.com/v2fly/v2ray-core/v5/main/z/rvstore"
 )
 
 const (
 	tunDNSOutboundTag = "dns-out"
 	tunDNSInboundTag  = "tun-dns-in"
-	// 国内 DNS 必须 tcp+local：走 DialSystem+绑网卡，不经 dispatcher，避免被 TUN/dns-out 劫持。
-	tunCNResolver = "tcp+local://223.5.5.5:53"
-	tunCNDNSTag   = "tun-dns-cn"
-	// UDP/53 经代理常不通；TCP DNS 可走代理出站。
-	tunRemoteResolver = "tcp://8.8.8.8:53"
+	tunCNDNSTag       = "tun-dns-cn"
+	tunRemoteDNSTag   = "tun-dns-remote"
+	tunDockerDNSTag   = "tun-dns-docker"
+	dockerDNSAddr     = "tcp+local://127.0.0.11:53"
 )
 
+// lookupDockerInternalDNS Docker 内置 DNS。测试可替换。
+var lookupDockerInternalDNS = dockerInternalDNSAddr
+
 // ApplyTunOwnerDNSPolicy 为 TUN 拥有者注入 FakeDNS、国内真实解析与 UDP/53→dns 出站路由（对齐 sing-box TUN DNS）。
-func ApplyTunOwnerDNSPolicy(raw string) (string, error) {
+// profile 中 cn_dns / remote_dns / fakedns_domains 可空（用默认）。
+func ApplyTunOwnerDNSPolicy(raw string, profile rvstore.TunProfile) (string, error) {
 	if raw == "" {
 		return raw, nil
 	}
@@ -35,49 +42,78 @@ func ApplyTunOwnerDNSPolicy(raw string) (string, error) {
 	}
 	tunTag := tunInboundTag(tun)
 	ensureDNSOutbound(doc)
-	ensureTunOwnerDNS(doc)
+	ensureTunOwnerDNS(doc, profile)
 	ensureTunDNSInbound(doc)
 	ensureTunDNSForwardRule(doc)
 	ensureTunDNSRule(doc, tunTag)
+	ensureTunNTPDirectRule(doc, tunTag)
 	ensureRoutingDomainStrategy(doc)
 	_ = tunIPv4FromDoc(tun)
 	return marshalDoc(doc)
 }
 
-func ensureTunOwnerDNS(doc map[string]interface{}) {
+func ensureTunOwnerDNS(doc map[string]interface{}, profile rvstore.TunProfile) {
 	dns, _ := doc["dns"].(map[string]interface{})
 	if dns == nil {
 		dns = map[string]interface{}{}
 		doc["dns"] = dns
 	}
 	ensureFakeDNSPool(dns)
-	// 国内 → tcp+local://223.5.5.5（真直连，不经代理/TUN）；
-	// GFW/Google → FakeDNS；其余境外 → tcp://8.8.8.8 经代理。
-	const remoteTag = "tun-dns-remote"
-	remote := map[string]interface{}{
-		"address": tunRemoteResolver,
-		"tag":     remoteTag,
+	cnResolvers := profile.EffectiveCNResolvers()
+	remoteResolver := profile.EffectiveRemoteResolver()
+	fakeDomains := profile.EffectiveFakeDNSDomains()
+	fakeDomainList := make([]interface{}, 0, len(fakeDomains))
+	for _, d := range fakeDomains {
+		fakeDomainList = append(fakeDomainList, d)
 	}
-	if proxyTag := preferTUNProxyOutboundTag(doc); proxyTag != "" {
-		ensureDNSRemoteInboundRoute(doc, remoteTag, proxyTag)
+	// 国内+NTP → cn；FakeDNS 域 → fakedns；其余 → 环境递归 DNS（Docker 内置，否则境外经代理）。
+	cnDomains := []interface{}{"geosite:cn"}
+	for _, h := range rvstore.DefaultTrueResolveBypassHosts() {
+		cnDomains = append(cnDomains, "full:"+h, "domain:"+h)
 	}
-	dns["servers"] = []interface{}{
-		map[string]interface{}{
-			"address":      tunCNResolver,
-			"domains":      []interface{}{"geosite:cn"},
+	servers := make([]interface{}, 0, len(cnResolvers)+2)
+	for i, addr := range cnResolvers {
+		item := map[string]interface{}{
+			"address":      addr,
+			"domains":      cnDomains,
 			"skipFallback": true,
-			"tag":          tunCNDNSTag,
-		},
+		}
+		if i == 0 {
+			item["tag"] = tunCNDNSTag
+		} else {
+			item["tag"] = fmt.Sprintf("%s-%d", tunCNDNSTag, i)
+		}
+		servers = append(servers, item)
+	}
+	servers = append(servers,
 		map[string]interface{}{
 			"address":      "fakedns",
-			"domains":      []interface{}{"geosite:gfw", "geosite:google", "geosite:youtube", "geosite:geolocation-!cn"},
+			"domains":      fakeDomainList,
 			"skipFallback": true,
 		},
-		remote,
-	}
+		catchAllDNSServer(doc, remoteResolver),
+	)
+	dns["servers"] = servers
 	if asString(dns["queryStrategy"]) == "" {
 		dns["queryStrategy"] = "UseIPv4"
 	}
+}
+
+func catchAllDNSServer(doc map[string]interface{}, remoteResolver string) map[string]interface{} {
+	if dockerDNS := lookupDockerInternalDNS(); dockerDNS != "" {
+		return map[string]interface{}{
+			"address": dockerDNS,
+			"tag":     tunDockerDNSTag,
+		}
+	}
+	remote := map[string]interface{}{
+		"address": remoteResolver,
+		"tag":     tunRemoteDNSTag,
+	}
+	if proxyTag := preferTUNProxyOutboundTag(doc); proxyTag != "" {
+		ensureDNSRemoteInboundRoute(doc, tunRemoteDNSTag, proxyTag)
+	}
+	return remote
 }
 
 func preferTUNProxyOutboundTag(doc map[string]interface{}) string {
@@ -198,74 +234,6 @@ func hasFakeDNSPool(dns map[string]interface{}) bool {
 	}
 }
 
-func ensureTunDNSServers(dns map[string]interface{}) {
-	servers, _ := dns["servers"].([]interface{})
-	if !hasCNResolver(servers) {
-		servers = append([]interface{}{map[string]interface{}{
-			"address":      tunCNResolver,
-			"domains":      []interface{}{"geosite:cn"},
-			"skipFallback": true,
-		}}, servers...)
-	}
-	if !hasFakeDNSServer(servers) {
-		servers = append(servers, "fakedns")
-	}
-	dns["servers"] = servers
-}
-
-func hasCNResolver(servers []interface{}) bool {
-	for _, item := range servers {
-		switch s := item.(type) {
-		case string:
-			if s == tunCNResolver {
-				return true
-			}
-		case map[string]interface{}:
-			if asString(s["address"]) != tunCNResolver {
-				continue
-			}
-			if serverHasDomain(s, "geosite:cn") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func hasFakeDNSServer(servers []interface{}) bool {
-	for _, item := range servers {
-		switch s := item.(type) {
-		case string:
-			if strings.EqualFold(s, "fakedns") {
-				return true
-			}
-		case map[string]interface{}:
-			if strings.EqualFold(asString(s["address"]), "fakedns") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func serverHasDomain(server map[string]interface{}, want string) bool {
-	raw, ok := server["domains"]
-	if !ok {
-		return false
-	}
-	switch domains := raw.(type) {
-	case string:
-		return domains == want
-	case []interface{}:
-		for _, d := range domains {
-			if asString(d) == want {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func ensureDNSOutbound(doc map[string]interface{}) {
 	if hasOutboundTag(doc, tunDNSOutboundTag) {
 		return
@@ -280,20 +248,26 @@ func ensureDNSOutbound(doc map[string]interface{}) {
 }
 
 func ensureTunDNSInbound(doc map[string]interface{}) {
+	port := singtun.TunDNSForwardPort
+	if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+		// Windows/Linux：系统 DNS=127.0.0.1，本机 :53 dokodemo 进 dns-out。
+		// Darwin 用 Helper :53→53535，dokodemo 仍在 53535。
+		port = 53
+	}
 	inRaw, _ := doc["inbounds"].([]interface{})
-	for _, item := range inRaw {
+	for i, item := range inRaw {
 		in, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if asString(in["tag"]) == tunDNSInboundTag {
-			return
+		if asString(in["tag"]) != tunDNSInboundTag {
+			continue
 		}
-	}
-	port := singtun.TunDNSForwardPort
-	if runtime.GOOS == "windows" {
-		// Windows 系统 DNS 固定 :53；与 DNSServers=127.0.0.1 对齐。
-		port = 53
+		in["listen"] = "127.0.0.1"
+		in["port"] = port
+		inRaw[i] = in
+		doc["inbounds"] = inRaw
+		return
 	}
 	inRaw = append(inRaw, map[string]interface{}{
 		"listen":   "127.0.0.1",
@@ -356,6 +330,49 @@ func hasInboundDNSForwardRule(rules []interface{}) bool {
 	return false
 }
 
+func ensureTunNTPDirectRule(doc map[string]interface{}, tunTag string) {
+	directTag := firstDirectOutboundTag(doc)
+	if directTag == "" {
+		directTag = "direct"
+	}
+	routing, _ := doc["routing"].(map[string]interface{})
+	if routing == nil {
+		routing = map[string]interface{}{}
+		doc["routing"] = routing
+	}
+	rules, _ := routing["rules"].([]interface{})
+	if hasTunNTPDirectRule(rules, tunTag, directTag) {
+		return
+	}
+	rules = append([]interface{}{map[string]interface{}{
+		"type":        "field",
+		"inboundTag":  []interface{}{tunTag},
+		"network":     "udp",
+		"port":        "123",
+		"outboundTag": directTag,
+	}}, rules...)
+	routing["rules"] = rules
+}
+
+func hasTunNTPDirectRule(rules []interface{}, tunTag, directTag string) bool {
+	for _, item := range rules {
+		rule, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if !ruleMatchesInbound(rule, tunTag) {
+			continue
+		}
+		if asString(rule["port"]) != "123" {
+			continue
+		}
+		if asString(rule["outboundTag"]) == directTag {
+			return true
+		}
+	}
+	return false
+}
+
 func ensureTunDNSRule(doc map[string]interface{}, tunTag string) {
 	routing, _ := doc["routing"].(map[string]interface{})
 	if routing == nil {
@@ -404,6 +421,35 @@ func ensureRoutingDomainStrategy(doc map[string]interface{}) {
 	if ds == "" || strings.EqualFold(ds, "AsIs") {
 		routing["domainStrategy"] = "IPIfNonMatch"
 	}
+}
+
+func dockerInternalDNSAddr() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	for _, path := range []string{"/etc/resolv.conf.rocket-bak", "/etc/resolv.conf"} {
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		has := resolvHasNameserver(f, "127.0.0.11")
+		_ = f.Close()
+		if has {
+			return dockerDNSAddr
+		}
+	}
+	return ""
+}
+
+func resolvHasNameserver(r io.Reader, ip string) bool {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) >= 2 && fields[0] == "nameserver" && fields[1] == ip {
+			return true
+		}
+	}
+	return false
 }
 
 func tunIPv4FromDoc(tun map[string]interface{}) string {

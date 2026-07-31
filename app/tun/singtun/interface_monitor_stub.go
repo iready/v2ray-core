@@ -10,4 +10,8 @@ func EnsureStandaloneMonitor() error { return nil }
 
 func CurrentInterfaceName() string { return "" }
 
+func RegisterDefaultInterfaceUpdate(func(name string)) (unregister func(), err error) {
+	return func() {}, nil
+}
+
 func detachInterfaceMonitors() {}

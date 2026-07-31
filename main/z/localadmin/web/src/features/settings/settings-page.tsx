@@ -1,7 +1,19 @@
-import { useEffect, useState } from 'react'
-import { Plus, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Plus, Shield, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
-import { fetchConfig, saveConfig, type AddressPreset, type AgentConfig } from '@/api/client'
+import {
+  apiErrorMessage,
+  fetchConfig,
+  fetchStatus,
+  installAutostart,
+  relaunchAutostart,
+  saveConfig,
+  uninstallAutostart,
+  type AddressPreset,
+  type AgentConfig,
+  type StatusSnapshot,
+} from '@/api/client'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -11,17 +23,36 @@ import { Separator } from '@/components/ui/separator'
 
 const emptyPreset = (): AddressPreset => ({ name: '', url: '' })
 
+function StatusBadge({ ok, okLabel, failLabel }: { ok: boolean; okLabel: string; failLabel: string }) {
+  return <Badge variant={ok ? 'success' : 'destructive'}>{ok ? okLabel : failLabel}</Badge>
+}
+
 export default function SettingsPage() {
   const [cfg, setCfg] = useState<AgentConfig | null>(null)
+  const [runtime, setRuntime] = useState<StatusSnapshot | null>(null)
   const [saving, setSaving] = useState(false)
+  const [autostartLoading, setAutostartLoading] = useState(false)
+
+  const loadRuntime = useCallback(async () => {
+    try {
+      setRuntime(await fetchStatus())
+    } catch (e) {
+      console.error(e)
+    }
+  }, [])
 
   useEffect(() => {
     fetchConfig().then(setCfg).catch(console.error)
-  }, [])
+    void loadRuntime()
+  }, [loadRuntime])
 
   if (!cfg) {
     return <p className="text-muted-foreground text-sm">加载中...</p>
   }
+
+  const feat = runtime?.features ?? {}
+  const showElevatedAuth = !!feat.elevated_auth
+  const showLoginAutostart = !!feat.login_autostart
 
   const updatePreset = (index: number, field: keyof AddressPreset, value: string) => {
     const presets = [...cfg.presets]
@@ -51,12 +82,109 @@ export default function SettingsPage() {
     }
   }
 
+  async function handleInstallAutostart(): Promise<void> {
+    setAutostartLoading(true)
+    try {
+      const r = await installAutostart()
+      toast.success(r.message || '已开启自启')
+      await loadRuntime()
+    } catch (e: unknown) {
+      toast.error(apiErrorMessage(e, '开启失败'))
+    } finally {
+      setAutostartLoading(false)
+    }
+  }
+
+  async function handleUninstallAutostart(): Promise<void> {
+    setAutostartLoading(true)
+    try {
+      const r = await uninstallAutostart()
+      toast.success(r.message || '已关闭自启')
+      await loadRuntime()
+    } catch (e: unknown) {
+      toast.error(apiErrorMessage(e, '关闭失败'))
+    } finally {
+      setAutostartLoading(false)
+    }
+  }
+
+  async function handleRelaunchAutostart(): Promise<void> {
+    setAutostartLoading(true)
+    try {
+      const r = await relaunchAutostart()
+      toast.success(r.message || '正在提权重启')
+      if (!r.elevated) {
+        setTimeout(() => window.location.reload(), 1200)
+      } else {
+        await loadRuntime()
+        setAutostartLoading(false)
+      }
+    } catch (e: unknown) {
+      toast.error(apiErrorMessage(e, '提权重启失败'))
+      setAutostartLoading(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">连接配置</h1>
-        <p className="text-muted-foreground mt-1 text-sm">配置 Rocket WebSocket 地址、Token 与 mTLS</p>
+        <p className="text-muted-foreground mt-1 text-sm">
+          Rocket 地址、Token、mTLS，以及登录自启 / 提权。
+        </p>
       </div>
+
+      {(showElevatedAuth || showLoginAutostart) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Shield className="size-4" />
+              {showElevatedAuth ? '权限与自启' : '登录自启'}
+            </CardTitle>
+            <CardDescription>
+              {showElevatedAuth
+                ? 'Windows 开 TUN 需管理员；可注册提权自启或立即提权重启'
+                : '注册 LaunchAgent，登录后自动拉起 rocket'}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              {showElevatedAuth ? (
+                <StatusBadge ok={!!runtime?.elevated} okLabel="已提权" failLabel="未提权" />
+              ) : null}
+              <StatusBadge
+                ok={!!runtime?.autostart_installed}
+                okLabel={showElevatedAuth ? '提权自启已开' : '登录自启已开'}
+                failLabel={showElevatedAuth ? '提权自启未开' : '登录自启未开'}
+              />
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {!runtime?.autostart_installed ? (
+                <Button onClick={() => void handleInstallAutostart()} disabled={autostartLoading}>
+                  {showElevatedAuth ? '开启提权自启' : '开启登录自启'}
+                </Button>
+              ) : (
+                <Button
+                  variant="outline"
+                  onClick={() => void handleUninstallAutostart()}
+                  disabled={autostartLoading}
+                >
+                  {showElevatedAuth ? '关闭提权自启' : '关闭登录自启'}
+                </Button>
+              )}
+              {showElevatedAuth && !runtime?.elevated ? (
+                <Button
+                  variant="secondary"
+                  onClick={() => void handleRelaunchAutostart()}
+                  disabled={autostartLoading || !runtime?.autostart_installed}
+                >
+                  立即提权重启
+                </Button>
+              ) : null}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>
@@ -180,7 +308,9 @@ export default function SettingsPage() {
                 <Input
                   placeholder="Server Name（可选）"
                   value={cfg.tls.server_name || ''}
-                  onChange={(e) => setCfg({ ...cfg, tls: { ...cfg.tls, server_name: e.target.value } })}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, tls: { ...cfg.tls, server_name: e.target.value } })
+                  }
                 />
               </div>
             )}

@@ -18,6 +18,11 @@ type TunProfileResponse struct {
 	BindInterface           string                 `json:"bind_interface,omitempty"`
 	BindInterfaceCandidates []string               `json:"bind_interface_candidates,omitempty"`
 	BindInterfaceEffective  string                 `json:"bind_interface_effective,omitempty"`
+	CnDNS                   []string               `json:"cn_dns,omitempty"`
+	CnDNSDefault            []string               `json:"cn_dns_default"`
+	RemoteDNS               string                 `json:"remote_dns,omitempty"`
+	RemoteDNSDefault        string                 `json:"remote_dns_default"`
+	FakeDNSDomains          []string               `json:"fakedns_domains,omitempty"`
 	BypassRocketServer      *bool                  `json:"bypass_rocket_server,omitempty"`
 	BypassLAN               *bool                  `json:"bypass_lan,omitempty"`
 	BypassLoopback          *bool                  `json:"bypass_loopback,omitempty"`
@@ -34,6 +39,11 @@ func tunProfileResponse(profile rvstore.TunProfile, serverHasTemplate bool, cand
 		BindInterface:           profile.BindInterface,
 		BindInterfaceCandidates: tunctl.ListBindInterfaceCandidates(),
 		BindInterfaceEffective:  bindEffective,
+		CnDNS:                   profile.CnDNS,
+		CnDNSDefault:            rvstore.DefaultCNResolvers(),
+		RemoteDNS:               profile.RemoteDNS,
+		RemoteDNSDefault:        rvstore.DefaultRemoteResolver,
+		FakeDNSDomains:          profile.FakeDNSDomains,
 		BypassRocketServer:      profile.BypassRocketServer,
 		BypassLAN:               profile.BypassLAN,
 		BypassLoopback:          profile.BypassLoopback,
@@ -52,15 +62,15 @@ func (h *Handler) tunOwnerCandidates() []string {
 }
 
 func (h *Handler) bindInterfaceEffective() string {
+	if iface := tunctl.CurrentBindInterface(); iface != "" {
+		return iface
+	}
 	if h.hooks.GetRS != nil {
 		if rs := h.hooks.GetRS(); rs != nil {
-			st := rs.Status()
-			if st.TunBindInterface != "" {
-				return st.TunBindInterface
-			}
+			return rs.Status().TunBindInterface
 		}
 	}
-	return tunctl.CurrentBindInterface()
+	return ""
 }
 
 func (h *Handler) GetTunProfile(c *gin.Context) {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/v2fly/v2ray-core/v5/app/tun/singtun"
 	"github.com/v2fly/v2ray-core/v5/main/z/rocket"
 	"github.com/v2fly/v2ray-core/v5/main/z/tunctl"
 	"github.com/v2fly/v2ray-core/v5/main/z/wire"
@@ -53,8 +54,33 @@ type DiagnoseReport struct {
 }
 
 func (h *Handler) PostDiagnose(c *gin.Context) {
-	report := h.runDiagnose()
-	c.JSON(http.StatusOK, report)
+	// 网络卡死时系统 DNS 可能无视 cancel；整份报告硬超时，避免排查页一直转圈。
+	type result struct{ report DiagnoseReport }
+	ch := make(chan result, 1)
+	go func() {
+		ch <- result{report: h.runDiagnose()}
+	}()
+	select {
+	case r := <-ch:
+		c.JSON(http.StatusOK, r.report)
+	case <-time.After(14 * time.Second):
+		c.JSON(http.StatusOK, DiagnoseReport{
+			OK:      false,
+			Summary: "排查整体超时（本机 DNS/出口卡住，网络恢复前探测无法完成）",
+			Verdict: "本机解析或出口卡住，排查自身也被拖死；先关 TUN 或重启 rocket 再测",
+			Cause:   "diagnose_timeout",
+			Fix:     "本地后台关 TUN 试国内网；或提权重启 rocket。网络恢复后重跑排查",
+			Checks: []DiagnoseCheck{{
+				ID:      "timeout",
+				Title:   "排查超时",
+				OK:      false,
+				Level:   "fail",
+				Detail:  "14s 内未完成全部探测（常见于 127.0.0.1 DNS/FakeDNS 堵死）",
+				Hint:    "卡顿时不要等排查；先关 TUN 恢复国内，再开排查",
+				Elapsed: "14s",
+			}},
+		})
+	}
 }
 
 func (h *Handler) runDiagnose() DiagnoseReport {
@@ -83,34 +109,64 @@ func (h *Handler) runDiagnose() DiagnoseReport {
 	checks = append(checks, checkTun(snap))
 	checks = append(checks, h.checkBindInterface(snap))
 	checks = append(checks, checkStaleDNS(snap))
-	checks = append(checks, checkCNDNS(snap))
-	tunOn := snap.TunActive || snap.TunEnabled
+	checks = append(checks, withCheckTimeout("direct_dns", "国内 DNS", cnDNSHint(snap), 4*time.Second, func() DiagnoseCheck {
+		return checkCNDNS(snap)
+	}))
+	tunOn := snap.TunHijack
+	dnsTarget := diagnoseDNSTarget(tunOn)
 	if tunOn {
 		// TUN 下仅 TCP 建连会被 FakeDNS 假 IP「秒过」，必须拉真实 HTTPS。
-		checks = append(checks, checkHTTPSGet("https_cn", "国内 HTTPS (www.baidu.com)",
-			"https://www.baidu.com/", cnHTTPSHint(snap)))
-		checks = append(checks, checkHTTPSGet("https_proxy", "外网 HTTPS (www.google.com)",
-			"https://www.google.com/generate_204", proxyHTTPSHint(snap)))
-		checks = append(checks, checkForeignIPProxy(snap))
+		checks = append(checks, withCheckTimeout("https_cn", "国内 HTTPS (www.baidu.com)", cnHTTPSHint(snap), 6*time.Second, func() DiagnoseCheck {
+			return checkHTTPSGet("https_cn", "国内 HTTPS (www.baidu.com)",
+				"https://www.baidu.com/", "www.baidu.com", dnsTarget, cnHTTPSHint(snap))
+		}))
+		checks = append(checks, withCheckTimeout("https_proxy", "外网 HTTPS (www.google.com)", proxyHTTPSHint(snap), 6*time.Second, func() DiagnoseCheck {
+			return checkHTTPSGet("https_proxy", "外网 HTTPS (www.google.com)",
+				"https://www.google.com/generate_204", "www.google.com", dnsTarget, proxyHTTPSHint(snap))
+		}))
+		checks = append(checks, withCheckTimeout("https_foreign_ip", "外网代理路径 (1.1.1.1:443 TLS)",
+			"此项失败而 Google FakeDNS 仍过：代理出站/绑网卡有问题，或浏览器 DoH 拿到真 IP 后走不通",
+			5*time.Second, func() DiagnoseCheck { return checkForeignIPProxy(snap) }))
 	} else {
-		checks = append(checks, checkTCP("https_cn", "国内 HTTPS (www.baidu.com:443)", "www.baidu.com:443",
-			cnHTTPSHint(snap)))
-		checks = append(checks, checkTCP("https_proxy", "外网 HTTPS (www.google.com:443)", "www.google.com:443",
-			proxyHTTPSHint(snap)))
+		checks = append(checks, withCheckTimeout("https_cn", "国内 HTTPS (www.baidu.com:443)", cnHTTPSHint(snap), 5*time.Second, func() DiagnoseCheck {
+			return checkTCP("https_cn", "国内 HTTPS (www.baidu.com:443)", "www.baidu.com:443", dnsTarget, cnHTTPSHint(snap))
+		}))
+		checks = append(checks, withCheckTimeout("https_proxy", "外网 HTTPS (www.google.com:443)", proxyHTTPSHint(snap), 5*time.Second, func() DiagnoseCheck {
+			return checkTCP("https_proxy", "外网 HTTPS (www.google.com:443)", "www.google.com:443", dnsTarget, proxyHTTPSHint(snap))
+		}))
 	}
 
 	if addr := strings.TrimSpace(snap.Addr); addr != "" {
 		host := wire.HostFromURL(addr)
 		if host != "" {
-			port := "443"
-			if strings.Contains(host, ":") {
-				h2, p, err := net.SplitHostPort(host)
-				if err == nil {
-					host, port = h2, p
-				}
+			port := wire.PortFromURL(addr)
+			if port == "" {
+				port = "443"
 			}
-			checks = append(checks, checkTCP("wire_host", "Rocket 控制面 "+host+":"+port, net.JoinHostPort(host, port),
-				"控制面不通：无法拉配置/重连，检查防火墙或服务端"))
+			// Linux Docker：TUN 改 resolv 后容器名可能短时不可解析；Wire 已通则控制面实测已通。
+			if runtime.GOOS == "linux" && snap.WireConnected {
+				checks = append(checks, DiagnoseCheck{
+					ID:     "wire_host",
+					Title:  "Rocket 控制面 " + host + ":" + port,
+					OK:     true,
+					Level:  "ok",
+					Detail: "Wire 已连接（跳过主机名重解析）",
+				})
+			} else if snap.WireConnected {
+				checks = append(checks, DiagnoseCheck{
+					ID:     "wire_host",
+					Title:  "Rocket 控制面 " + host + ":" + port,
+					OK:     true,
+					Level:  "ok",
+					Detail: "Wire 已连接（跳过重拨，避免卡顿时排查挂死）",
+				})
+			} else {
+				checks = append(checks, withCheckTimeout("wire_host", "Rocket 控制面 "+host+":"+port,
+					"控制面不通：无法拉配置/重连，检查防火墙或服务端", 5*time.Second, func() DiagnoseCheck {
+						return checkTCP("wire_host", "Rocket 控制面 "+host+":"+port, net.JoinHostPort(host, port), dnsTarget,
+							"控制面不通：无法拉配置/重连，检查防火墙或服务端")
+					}))
+			}
 		}
 	}
 
@@ -245,11 +301,22 @@ func checkTun(snap StatusSnapshot) DiagnoseCheck {
 		return ch
 	}
 	if snap.TunActive && snap.TunEnabled {
+		if snap.TunHijack {
+			ch.OK = true
+			ch.Level = "ok"
+			ch.Detail = "TUN 正在劫持默认路由"
+			if snap.TunIfName != "" {
+				ch.Detail += "（" + snap.TunIfName + "）"
+			}
+			return ch
+		}
 		ch.OK = true
-		ch.Level = "ok"
-		ch.Detail = "TUN 已生效"
-		if snap.TunIfName != "" {
-			ch.Detail += "（" + snap.TunIfName + "）"
+		ch.Level = "warn"
+		ch.Detail = "TUN 网卡在跑，默认路由已卸下"
+		if zh := tunctl.HijackPausedZH(snap.TunHijackPaused); zh != "" {
+			ch.Detail += "：" + zh
+		} else {
+			ch.Detail += "（暂直出）"
 		}
 		return ch
 	}
@@ -315,8 +382,8 @@ func checkStaleDNS(snap StatusSnapshot) DiagnoseCheck {
 		Title:   "系统 DNS 残留",
 		Elapsed: time.Since(start).Round(time.Millisecond).String(),
 	}
-	// TUN 生效时适配器 DNS 由 sing-tun 管理；物理网卡不应再被钉 127.0.0.1。
-	if snap.TunActive || snap.TunEnabled {
+	// 正在劫持时适配器 DNS 由 sing-tun 管理；物理网卡不应再被钉 127.0.0.1。
+	if snap.TunHijack {
 		if len(stale) == 0 {
 			ch.OK = true
 			ch.Level = "ok"
@@ -342,11 +409,35 @@ func checkStaleDNS(snap StatusSnapshot) DiagnoseCheck {
 	return ch
 }
 
-func checkTCP(id, title, address, hint string) DiagnoseCheck {
+func checkTCP(id, title, address, dnsTarget, hint string) DiagnoseCheck {
 	start := time.Now()
 	ch := DiagnoseCheck{ID: id, Title: title, Hint: hint}
-	d := net.Dialer{Timeout: 4 * time.Second}
-	conn, err := d.DialContext(context.Background(), "tcp", address)
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		ch.OK = false
+		ch.Level = "fail"
+		ch.Detail = err.Error()
+		ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
+		return ch
+	}
+	dialAddr := address
+	if ip := net.ParseIP(host); ip == nil {
+		ips, _, resErr := resolveHostIPsPrefer(host, dnsTarget, 2*time.Second)
+		if resErr != nil || len(ips) == 0 {
+			ch.OK = false
+			ch.Level = "fail"
+			if resErr != nil {
+				ch.Detail = "DNS：" + resErr.Error()
+			} else {
+				ch.Detail = "DNS：无记录"
+			}
+			ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
+			return ch
+		}
+		dialAddr = net.JoinHostPort(ips[0], port)
+	}
+	d := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.DialContext(context.Background(), "tcp", dialAddr)
 	ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
 	if err != nil {
 		ch.OK = false
@@ -358,17 +449,89 @@ func checkTCP(id, title, address, hint string) DiagnoseCheck {
 	ch.OK = true
 	ch.Level = "ok"
 	ch.Detail = "TCP 连通"
+	if dialAddr != address {
+		ch.Detail = "经 " + dialAddr + " TCP 连通"
+	}
 	return ch
 }
 
-func diagnoseHTTPClient() *http.Client {
+func diagnoseDNSTarget(tunOn bool) string {
+	if tunOn {
+		return localCNDNSTarget()
+	}
+	return "223.5.5.5:53"
+}
+
+func withCheckTimeout(id, title, hint string, d time.Duration, fn func() DiagnoseCheck) DiagnoseCheck {
+	done := make(chan DiagnoseCheck, 1)
+	go func() {
+		done <- fn()
+	}()
+	select {
+	case r := <-done:
+		if r.ID == "" {
+			r.ID = id
+		}
+		if r.Title == "" {
+			r.Title = title
+		}
+		return r
+	case <-time.After(d):
+		return DiagnoseCheck{
+			ID:      id,
+			Title:   title,
+			OK:      false,
+			Level:   "fail",
+			Detail:  fmt.Sprintf("探测超时 %s（本机 DNS/出口卡住时常见）", d.Round(time.Millisecond)),
+			Hint:    hint,
+			Elapsed: d.Round(time.Millisecond).String(),
+		}
+	}
+}
+
+func resolveHostIPsPrefer(host, dnsAddr string, timeout time.Duration) (ips []string, fake bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: timeout}
+			// 强制走指定 DNS，避开 Windows 系统解析（卡死时常无视 ctx）。
+			return d.DialContext(ctx, "udp", dnsAddr)
+		},
+	}
+	addrs, err := r.LookupHost(ctx, host)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, a := range addrs {
+		ips = append(ips, a)
+		if addr, perr := netip.ParseAddr(a); perr == nil && singtun.IsFakeDNSAddr(addr) {
+			fake = true
+		}
+	}
+	return ips, fake, nil
+}
+
+func diagnoseHTTPClientToIP(ip, serverName string) *http.Client {
 	return &http.Client{
-		Timeout: 8 * time.Second,
+		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
-			Proxy:                 nil,
-			DialContext:           (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   4 * time.Second,
-			ResponseHeaderTimeout: 4 * time.Second,
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				_, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					port = "443"
+				}
+				d := net.Dialer{Timeout: 3 * time.Second}
+				return d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+			},
+			TLSClientConfig: &tls.Config{
+				ServerName: serverName,
+				MinVersion: tls.VersionTLS12,
+			},
+			TLSHandshakeTimeout:   3 * time.Second,
+			ResponseHeaderTimeout: 3 * time.Second,
 			ForceAttemptHTTP2:     false,
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -377,70 +540,47 @@ func diagnoseHTTPClient() *http.Client {
 	}
 }
 
-func isFakeDNSIP(ip string) bool {
-	addr, err := netip.ParseAddr(ip)
-	if err != nil {
-		return false
-	}
-	// sing-tun 默认池 198.18.0.0/16；路由里也按 /15 覆盖。
-	p16, _ := netip.ParsePrefix("198.18.0.0/16")
-	p15, _ := netip.ParsePrefix("198.18.0.0/15")
-	return p16.Contains(addr) || p15.Contains(addr)
-}
-
-func resolveHostIPs(host string) (ips []string, fake bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
-	if err != nil {
-		return nil, false
-	}
-	for _, a := range addrs {
-		ips = append(ips, a)
-		if isFakeDNSIP(a) {
-			fake = true
-		}
-	}
-	return ips, fake
-}
-
-// checkHTTPSGet 走系统默认路由发真实 HTTPS（TUN 开着时即测 FakeDNS+代理整条链）。
-func checkHTTPSGet(id, title, rawURL, hint string) DiagnoseCheck {
+// checkHTTPSGet 先 PreferGo 解析，再按 IP 拨号（带 SNI），避免系统 DNS 挂死拖垮排查。
+func checkHTTPSGet(id, title, rawURL, host, dnsTarget, hint string) DiagnoseCheck {
 	start := time.Now()
 	ch := DiagnoseCheck{ID: id, Title: title, Hint: hint}
-	host := ""
-	if u, err := http.NewRequest(http.MethodGet, rawURL, nil); err == nil && u.URL != nil {
-		host = u.URL.Hostname()
-	}
-	var resolveNote string
-	if host != "" {
-		ips, fake := resolveHostIPs(host)
-		if len(ips) > 0 {
-			resolveNote = fmt.Sprintf("解析 %v", ips)
-			if fake {
-				resolveNote += "（含 FakeDNS）"
-			}
+	ips, fake, err := resolveHostIPsPrefer(host, dnsTarget, 2*time.Second)
+	if err != nil || len(ips) == 0 {
+		ch.OK = false
+		ch.Level = "fail"
+		ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
+		if err != nil {
+			ch.Detail = "DNS：" + err.Error()
+		} else {
+			ch.Detail = "DNS：无记录"
 		}
+		return ch
 	}
-	resp, err := diagnoseHTTPClient().Get(rawURL)
+	resolveNote := fmt.Sprintf("解析 %v", ips)
+	if fake {
+		resolveNote += "（含 FakeDNS）"
+	}
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		ch.OK = false
+		ch.Level = "fail"
+		ch.Detail = resolveNote + "；" + err.Error()
+		ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
+		return ch
+	}
+	resp, err := diagnoseHTTPClientToIP(ips[0], host).Do(req)
 	ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
 	if err != nil {
 		ch.OK = false
 		ch.Level = "fail"
-		ch.Detail = err.Error()
-		if resolveNote != "" {
-			ch.Detail = resolveNote + "；" + ch.Detail
-		}
+		ch.Detail = resolveNote + "；" + err.Error()
 		return ch
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	_ = resp.Body.Close()
 	ch.OK = true
 	ch.Level = "ok"
-	ch.Detail = fmt.Sprintf("HTTP %d", resp.StatusCode)
-	if resolveNote != "" {
-		ch.Detail = resolveNote + "；" + ch.Detail
-	}
+	ch.Detail = fmt.Sprintf("%s；HTTP %d", resolveNote, resp.StatusCode)
 	return ch
 }
 
@@ -453,7 +593,7 @@ func checkForeignIPProxy(snap StatusSnapshot) DiagnoseCheck {
 		Title: "外网代理路径 (1.1.1.1:443 TLS)",
 		Hint:  "此项失败而 Google FakeDNS 仍过：代理出站/绑网卡有问题，或浏览器 DoH 拿到真 IP 后走不通",
 	}
-	d := net.Dialer{Timeout: 4 * time.Second}
+	d := net.Dialer{Timeout: 3 * time.Second}
 	raw, err := d.DialContext(context.Background(), "tcp", "1.1.1.1:443")
 	if err != nil {
 		ch.OK = false
@@ -467,7 +607,7 @@ func checkForeignIPProxy(snap StatusSnapshot) DiagnoseCheck {
 		InsecureSkipVerify: false,
 		MinVersion:         tls.VersionTLS12,
 	})
-	_ = tlsConn.SetDeadline(time.Now().Add(4 * time.Second))
+	_ = tlsConn.SetDeadline(time.Now().Add(3 * time.Second))
 	err = tlsConn.Handshake()
 	_ = tlsConn.Close()
 	ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
@@ -483,26 +623,29 @@ func checkForeignIPProxy(snap StatusSnapshot) DiagnoseCheck {
 	return ch
 }
 
-// checkCNDNS TUN 开启时测本机 DNS（127.0.0.1→dokodemo→国内解析）；关闭时仍测到 223.5.5.5 的 TCP。
+// localCNDNSTarget TUN 开启时本机 DNS 探测地址（按平台实际劫持目标）。
+func localCNDNSTarget() string {
+	switch runtime.GOOS {
+	case "linux", "windows":
+		return "127.0.0.1:53"
+	default:
+		// Darwin：helper 监听 :53，转发到 53535 dokodemo。
+		return "127.0.0.1:53"
+	}
+}
+
+// checkCNDNS TUN 开启时测本机 DNS（平台 DNS 劫持→国内解析）；关闭时仍测到 223.5.5.5 的 TCP。
 func checkCNDNS(snap StatusSnapshot) DiagnoseCheck {
 	start := time.Now()
-	tunOn := snap.TunActive || snap.TunEnabled
+	tunOn := snap.TunHijack
 	if tunOn {
+		target := localCNDNSTarget()
 		ch := DiagnoseCheck{
 			ID:    "direct_dns",
-			Title: "国内 DNS (via 127.0.0.1:53)",
+			Title: "国内 DNS (via " + target + ")",
 			Hint:  cnDNSHint(snap),
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		defer cancel()
-		r := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 2 * time.Second}
-				return d.DialContext(ctx, "udp", "127.0.0.1:53")
-			},
-		}
-		ips, err := r.LookupHost(ctx, "www.baidu.com")
+		ips, _, err := resolveHostIPsPrefer("www.baidu.com", target, 2*time.Second)
 		ch.Elapsed = time.Since(start).Round(time.Millisecond).String()
 		if err != nil {
 			ch.OK = false
@@ -515,25 +658,32 @@ func checkCNDNS(snap StatusSnapshot) DiagnoseCheck {
 		ch.Detail = fmt.Sprintf("解析 www.baidu.com → %v", ips)
 		return ch
 	}
-	return checkTCP("direct_dns", "直连 DNS (223.5.5.5:53)", "223.5.5.5:53", cnDNSHint(snap))
+	return checkTCP("direct_dns", "直连 DNS (223.5.5.5:53)", "223.5.5.5:53", "223.5.5.5:53", cnDNSHint(snap))
 }
 
 func cnDNSHint(snap StatusSnapshot) string {
-	if snap.TunActive || snap.TunEnabled {
-		return "开 TUN 仍失败：本机 :53 dokodemo/国内 tcp+local DNS 未通；可关开 TUN 或重启"
+	if snap.TunHijack {
+		switch runtime.GOOS {
+		case "darwin":
+			return "开 TUN 仍失败：本机 :53 dokodemo/国内 https+local DNS 未通；可关开 TUN 或重启"
+		case "linux":
+			return "开 TUN 仍失败：resolv.conf 未指 127.0.0.1 或本机 :53 dokodemo/国内 tcp+local 未通；可关开 TUN 或重启"
+		default:
+			return "开 TUN 仍失败：本机 dokodemo/国内 tcp+local DNS 未通；可关开 TUN 或重启"
+		}
 	}
-	return "失败时常见于 DNS 残留 127.0.0.1、未提权、或本机网络拦 223.5.5.5"
+	return "失败时常见于 DNS 残留、未提权、或本机网络拦 223.5.5.5"
 }
 
 func cnHTTPSHint(snap StatusSnapshot) string {
-	if snap.TunActive || snap.TunEnabled {
+	if snap.TunHijack {
 		return "开 TUN 国内不通、外网通：多为 FakeDNS 下 geosite:cn 真解析挂了"
 	}
 	return "国内站不通：检查本机网络/DNS/防火墙"
 }
 
 func proxyHTTPSHint(snap StatusSnapshot) string {
-	if snap.TunActive || snap.TunEnabled {
+	if snap.TunHijack {
 		return "须能真实打开页面；仅 TCP 秒过不算。失败查代理节点/出站绑网卡/FakeDNS"
 	}
 	return "TUN 已关时外网直连失败通常正常；开 TUN 后再测"
@@ -542,7 +692,7 @@ func proxyHTTPSHint(snap StatusSnapshot) string {
 func (h *Handler) checkRuntimeSnapshot(snap StatusSnapshot) DiagnoseCheck {
 	parts := []string{
 		fmt.Sprintf("os=%s elevated=%v", snap.OS, snap.Elevated),
-		fmt.Sprintf("tun_use=%v active=%v if=%q owner=%q", snap.TunLocalUse, snap.TunActive, snap.TunIfName, snap.TunOwnerKey),
+		fmt.Sprintf("tun_use=%v active=%v hijack=%v paused=%q if=%q owner=%q", snap.TunLocalUse, snap.TunActive, snap.TunHijack, snap.TunHijackPaused, snap.TunIfName, snap.TunOwnerKey),
 		fmt.Sprintf("bind=%q auto=%v", snap.TunBindIface, snap.TunBindAuto),
 		fmt.Sprintf("wire=%v servers=%d/%d", snap.WireConnected, snap.HealthyCount, snap.ServerCount),
 	}
@@ -627,7 +777,7 @@ func synthesizeVerdict(tunOn bool, byID map[string]DiagnoseCheck) (verdict, caus
 	case !cnDNS && (proxyHTTP || hasFakeDNSNote(byID, "https_proxy")):
 		return "国内 DNS 上游挂了：外网靠 FakeDNS 假 IP，国内站/真域名解析失败",
 			"cn_dns_upstream",
-			"确认包含 tcp+local://223.5.5.5；关开 TUN；看客户端标记是否最新"
+			"确认国内 DNS 上游（Darwin 默认 https+local、Linux/Windows 默认 tcp+local）；关开 TUN；看客户端标记是否最新"
 	case !cnHTTP && !proxyHTTP:
 		return "国内外 HTTPS 都挂：TUN 总出口或本机 DNS 全挂",
 			"tun_total",

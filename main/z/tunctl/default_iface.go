@@ -51,7 +51,11 @@ func SnapshotBindInterface(manual string) (string, error) {
 }
 
 // CurrentBindInterface 返回当前生效的出站绑定网卡名。
+// dial-bind 启用时以缓存为准（auto 下由监视器回调刷新）。
 func CurrentBindInterface() string {
+	if iface := getDialBindIface(); iface != "" {
+		return iface
+	}
 	bindIfaceMu.RLock()
 	defer bindIfaceMu.RUnlock()
 	if bindIfaceManual != "" {
@@ -61,6 +65,19 @@ func CurrentBindInterface() string {
 		return bindIfaceSnap
 	}
 	return singtun.CurrentInterfaceName()
+}
+
+// syncAutoBindSnap 与 dial-bind 缓存同步（仅 auto）。
+func syncAutoBindSnap(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	bindIfaceMu.Lock()
+	defer bindIfaceMu.Unlock()
+	if bindIfaceAuto && bindIfaceManual == "" {
+		bindIfaceSnap = name
+	}
 }
 
 // BindInterfaceAuto 是否使用自动探测（非用户指定）。

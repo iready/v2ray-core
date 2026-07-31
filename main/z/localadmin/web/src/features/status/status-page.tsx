@@ -1,19 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Activity, Copy, Link2, RefreshCw, Server, Shield, Stethoscope } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Activity, Link2, Power, RotateCw, Server } from 'lucide-react'
 import { toast } from 'sonner'
 import {
-  fetchStatus,
-  reconnect,
-  enableTun,
-  disableTun,
-  installTunHelper,
-  uninstallTunHelper,
-  runDiagnose,
-  installAutostart,
-  uninstallAutostart,
-  relaunchAutostart,
   apiErrorMessage,
-  type DiagnoseReport,
+  fetchStatus,
+  probeOutboundReach,
+  restartAgent,
+  stopAgent,
+  tunTrafficLabel,
+  type OutboundReach,
+  type OutboundSnapshot,
+  type ProbeLeg,
   type ServerInstanceStatus,
   type StatusSnapshot,
 } from '@/api/client'
@@ -59,223 +56,202 @@ function instanceBadge(inst: ServerInstanceStatus) {
   }
 }
 
-function formatDiagnoseLog(report: DiagnoseReport): string {
-  const lines: string[] = [
-    `$ rocket diagnose`,
-    `# ${new Date().toLocaleString()}`,
-    '',
-  ]
-  if (report.verdict) {
-    lines.push(`VERDICT: ${report.verdict}`)
-    if (report.cause) lines.push(`CAUSE:   ${report.cause}`)
-    if (report.fix) lines.push(`FIX:     ${report.fix}`)
-    lines.push('')
-  }
-  for (const ch of report.checks) {
-    const tag = ch.level === 'ok' ? 'PASS' : ch.level === 'warn' ? 'WARN' : 'FAIL'
-    const mark = ch.level === 'ok' ? '✓' : ch.level === 'warn' ? '!' : '✗'
-    lines.push(`[${mark}] ${tag.padEnd(4)} ${ch.title}${ch.elapsed ? ` (${ch.elapsed})` : ''}`)
-    lines.push(`      ${ch.detail}`)
-    if (ch.hint) {
-      lines.push(`      hint: ${ch.hint}`)
+function outboundEndpoint(ob: OutboundSnapshot): string | undefined {
+  if (!ob.address) return undefined
+  return ob.port ? `${ob.address}:${ob.port}` : ob.address
+}
+
+function outboundTransport(ob: OutboundSnapshot): string | undefined {
+  const parts = [ob.network, ob.security].filter((s) => s && s !== 'none')
+  return parts.length ? parts.join(' / ') : undefined
+}
+
+function reachKey(serverKey: string, tag: string): string {
+  return `${serverKey}\0${tag}`
+}
+
+function protocolLabel(protocol: string): string {
+  return (protocol || 'unknown').toUpperCase()
+}
+
+function groupOutbounds(list: OutboundSnapshot[]): { protocol: string; items: OutboundSnapshot[] }[] {
+  const buckets = new Map<string, OutboundSnapshot[]>()
+  for (const ob of list) {
+    if (!ob.remote) continue
+    const protocol = ob.protocol || 'unknown'
+    const bucket = buckets.get(protocol)
+    if (bucket) {
+      bucket.push(ob)
+    } else {
+      buckets.set(protocol, [ob])
     }
-    lines.push('')
   }
-  lines.push('─'.repeat(48))
-  lines.push(report.summary)
-  lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAILED')
-  return lines.join('\n')
+  return [...buckets.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([protocol, items]) => ({ protocol, items }))
+}
+
+function ProbeBadge({
+  label,
+  probing,
+  leg,
+}: {
+  label: string
+  probing: boolean
+  leg?: ProbeLeg
+}) {
+  if (probing) {
+    return <Badge variant="muted">{label} 探测中</Badge>
+  }
+  if (!leg) return null
+  return (
+    <Badge variant={leg.ok ? 'success' : 'destructive'}>
+      {label} {leg.ok ? `${leg.latency_ms}ms` : '不通'}
+    </Badge>
+  )
+}
+
+function tunHijackValue(status: StatusSnapshot): string | undefined {
+  if (!status.tun_local_use) return undefined
+  if (status.tun_degraded_reason && !status.tun_enabled) {
+    return `网卡未运行（${status.tun_degraded_reason}）`
+  }
+  return tunTrafficLabel(status)
+}
+
+async function waitUntilBack(): Promise<boolean> {
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 500))
+    try {
+      await fetchStatus()
+      return true
+    } catch {
+      /* 进程退出期间接口会断 */
+    }
+  }
+  return false
 }
 
 export default function StatusPage() {
   const [status, setStatus] = useState<StatusSnapshot | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [diagLoading, setDiagLoading] = useState(false)
-  const [diag, setDiag] = useState<DiagnoseReport | null>(null)
-  const [diagLog, setDiagLog] = useState('')
-  const diagLogRef = useRef<HTMLPreElement>(null)
+  const [restarting, setRestarting] = useState(false)
+  const [stopping, setStopping] = useState(false)
+  const [reachByKey, setReachByKey] = useState<Record<string, OutboundReach>>({})
+  const [probingKeys, setProbingKeys] = useState<Record<string, true>>({})
 
   const refresh = useCallback(async () => {
     try {
-      const data = await fetchStatus()
-      setStatus(data)
+      setStatus(await fetchStatus())
     } catch (e) {
       console.error(e)
     }
   }, [])
 
+  async function probeOne(ob: OutboundSnapshot): Promise<void> {
+    if (!ob.remote) return
+    const key = reachKey(ob.server_key, ob.tag)
+    setProbingKeys((prev) => ({ ...prev, [key]: true }))
+    try {
+      const item = await probeOutboundReach(ob.server_key, ob.tag)
+      setReachByKey((prev) => ({ ...prev, [key]: item }))
+    } catch (e) {
+      toast.error(apiErrorMessage(e, '出站探测失败'))
+    } finally {
+      setProbingKeys((prev) => {
+        const next = { ...prev }
+        delete next[key]
+        return next
+      })
+    }
+  }
+
+  async function probeAll(list: OutboundSnapshot[]): Promise<void> {
+    const remote = list.filter((o) => o.remote)
+    for (let i = 0; i < remote.length; i += 4) {
+      await Promise.all(remote.slice(i, i + 4).map((ob) => probeOne(ob)))
+    }
+  }
+
+  async function handleRestart(): Promise<void> {
+    setRestarting(true)
+    try {
+      await restartAgent()
+    } catch (e: unknown) {
+      const msg = apiErrorMessage(e, '')
+      if (msg && !/network|timeout|ECONN|Failed to fetch|Network Error/i.test(msg)) {
+        toast.error(apiErrorMessage(e, '重启失败'))
+        setRestarting(false)
+        return
+      }
+    }
+    toast.message('正在重启 Rocket…')
+    const ok = await waitUntilBack()
+    if (ok) {
+      window.location.reload()
+      return
+    }
+    toast.error('重启超时，请手动打开后台')
+    setRestarting(false)
+  }
+
+  async function handleStop(): Promise<void> {
+    if (!window.confirm('关闭并退出 Rocket？本机代理会断开。')) return
+    setStopping(true)
+    try {
+      await stopAgent()
+    } catch (e: unknown) {
+      const msg = apiErrorMessage(e, '')
+      if (msg && !/network|timeout|ECONN|Failed to fetch|Network Error/i.test(msg)) {
+        toast.error(apiErrorMessage(e, '停止失败'))
+        setStopping(false)
+        return
+      }
+    }
+    toast.message('Rocket 已退出')
+  }
+
   useEffect(() => {
-    refresh()
-    const id = setInterval(refresh, 5000)
+    if (restarting || stopping) return
+    void refresh()
+    const id = setInterval(() => void refresh(), 5000)
     return () => clearInterval(id)
-  }, [refresh])
-
-  useEffect(() => {
-    if (diagLogRef.current) {
-      diagLogRef.current.scrollTop = diagLogRef.current.scrollHeight
-    }
-  }, [diagLog, diagLoading])
-
-  const handleReconnect = async () => {
-    setLoading(true)
-    try {
-      await reconnect()
-      toast.success('已触发重连')
-      await refresh()
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : '重连失败'
-      toast.error(msg)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleDiagnose = async () => {
-    setDiagLoading(true)
-    setDiag(null)
-    setDiagLog(
-      [
-        '$ rocket diagnose',
-        `# ${new Date().toLocaleString()}`,
-        '',
-        'running checks…',
-        '  · 管理员权限 / 控制面 / 实例 / TUN',
-        '  · 绑网卡 / DNS / 国内·外网 HTTPS（TUN 下含真拉取与 1.1.1.1 TLS）',
-        '',
-      ].join('\n'),
-    )
-    try {
-      const report = await runDiagnose()
-      setDiag(report)
-      setDiagLog(formatDiagnoseLog(report))
-    } catch (e: unknown) {
-      const msg = apiErrorMessage(e, '排查失败')
-      setDiagLog((prev) => `${prev}\n✗ ERROR ${msg}\n`)
-      toast.error(msg)
-    } finally {
-      setDiagLoading(false)
-    }
-  }
-
-  const handleCopyDiagLog = async () => {
-    if (!diagLog) return
-    try {
-      await navigator.clipboard.writeText(diagLog)
-      toast.success('已复制排查日志')
-    } catch {
-      toast.error('复制失败')
-    }
-  }
-
-  const [tunLoading, setTunLoading] = useState(false)
-  const [autostartLoading, setAutostartLoading] = useState(false)
-
-  const handleInstallAutostart = async () => {
-    setAutostartLoading(true)
-    try {
-      const r = await installAutostart()
-      toast.success(r.message || '已开启提权自启')
-      await refresh()
-    } catch (e: unknown) {
-      toast.error(apiErrorMessage(e, '开启失败'))
-    } finally {
-      setAutostartLoading(false)
-    }
-  }
-
-  const handleUninstallAutostart = async () => {
-    setAutostartLoading(true)
-    try {
-      const r = await uninstallAutostart()
-      toast.success(r.message || '已关闭提权自启')
-      await refresh()
-    } catch (e: unknown) {
-      toast.error(apiErrorMessage(e, '关闭失败'))
-    } finally {
-      setAutostartLoading(false)
-    }
-  }
-
-  const handleRelaunchAutostart = async () => {
-    setAutostartLoading(true)
-    try {
-      const r = await relaunchAutostart()
-      toast.success(r.message || '正在提权重启')
-      if (!r.elevated) {
-        // 进程即将退出，稍后刷新会连上新实例
-        setTimeout(() => {
-          window.location.reload()
-        }, 1200)
-      } else {
-        await refresh()
-      }
-    } catch (e: unknown) {
-      toast.error(apiErrorMessage(e, '提权重启失败'))
-      setAutostartLoading(false)
-    }
-  }
-
-  const handleTunToggle = async () => {
-    setTunLoading(true)
-    try {
-      if (status?.tun_enabled) {
-        await disableTun()
-        toast.success('TUN 已关闭')
-      } else {
-        await enableTun()
-        toast.success('TUN 已开启')
-      }
-      await refresh()
-    } catch (e: unknown) {
-      toast.error(apiErrorMessage(e, 'TUN 操作失败'))
-    } finally {
-      setTunLoading(false)
-    }
-  }
-
-  const handleInstallHelper = async () => {
-    setTunLoading(true)
-    try {
-      await installTunHelper()
-      toast.success('Helper 安装完成')
-      await refresh()
-    } catch (e: unknown) {
-      toast.error(apiErrorMessage(e, '安装失败'))
-    } finally {
-      setTunLoading(false)
-    }
-  }
-
-  const handleUninstallHelper = async () => {
-    setTunLoading(true)
-    try {
-      await uninstallTunHelper()
-      toast.success('Helper 已拆卸')
-      await refresh()
-    } catch (e: unknown) {
-      toast.error(apiErrorMessage(e, '拆卸失败'))
-    } finally {
-      setTunLoading(false)
-    }
-  }
+  }, [refresh, restarting, stopping])
 
   if (!status) {
     return <p className="text-muted-foreground text-sm">加载中...</p>
   }
 
   const servers = status.servers ?? []
+  const outbounds = (status.outbounds ?? []).filter((o) => o.remote)
+  const probingAny = outbounds.some((o) => probingKeys[reachKey(o.server_key, o.tag)])
   const feat = status.features ?? {}
-  const isWindows = status.os === 'windows'
-  const isDarwin = status.os === 'darwin'
-  const showElevatedAuth = !!feat.elevated_auth
+  const showElevated = !!feat.elevated_auth
   const showHelper = !!feat.privileged_helper
   const showLoginAutostart = !!feat.login_autostart
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">运行状态</h1>
-        <p className="text-muted-foreground mt-1 text-sm">查看 Agent 连接与 v2ray 实例运行情况</p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">运行状态</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            一个 Rocket 进程；下面多条是它拉起的核心实例。开关与安装请到「TUN」「连接配置」。
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button
+            variant="destructive"
+            onClick={() => void handleStop()}
+            disabled={restarting || stopping}
+          >
+            <Power />
+            {stopping ? '正在退出…' : '停止'}
+          </Button>
+          <Button onClick={() => void handleRestart()} disabled={restarting || stopping}>
+            <RotateCw className={restarting ? 'animate-spin' : ''} />
+            {restarting ? '重启中…' : '重启 Rocket'}
+          </Button>
+        </div>
       </div>
 
       <div className="grid gap-4 sm:grid-cols-3">
@@ -305,7 +281,7 @@ export default function StatusPage() {
           <CardHeader className="pb-2">
             <CardDescription className="flex items-center gap-1.5">
               <Server className="size-3.5" />
-              v2ray 实例
+              核心实例
             </CardDescription>
             <CardTitle className="font-mono text-2xl">
               {status.healthy_count}/{status.server_count}
@@ -320,11 +296,11 @@ export default function StatusPage() {
       <Card>
         <CardHeader>
           <CardTitle>实例健康</CardTitle>
-          <CardDescription>各 v2ray 实例运行状态与配置版本</CardDescription>
+          <CardDescription>各核心实例运行状态与配置版本</CardDescription>
         </CardHeader>
         <CardContent>
           {servers.length === 0 ? (
-            <p className="text-muted-foreground text-sm">暂无运行中的 v2ray 实例</p>
+            <p className="text-muted-foreground text-sm">暂无运行中的核心实例</p>
           ) : (
             <div className="space-y-3">
               {servers.map((inst) => (
@@ -338,15 +314,101 @@ export default function StatusPage() {
                       {instanceBadge(inst)}
                       <Badge variant="outline">v{inst.version}</Badge>
                     </div>
-                    {inst.last_heartbeat && (
+                    {inst.last_heartbeat ? (
                       <p className="text-muted-foreground text-xs">启动于 {inst.last_heartbeat}</p>
-                    )}
-                    {inst.last_error && (
+                    ) : null}
+                    {inst.last_error ? (
                       <p className="text-destructive text-xs break-all">{inst.last_error}</p>
-                    )}
+                    ) : null}
                   </div>
-                  <span className="text-muted-foreground text-xs">{statusLabel[inst.status] ?? inst.status}</span>
+                  <span className="text-muted-foreground text-xs">
+                    {statusLabel[inst.status] ?? inst.status}
+                  </span>
                 </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-3 space-y-0">
+          <div className="space-y-1.5">
+            <CardTitle>出站</CardTitle>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={restarting || stopping || probingAny || outbounds.length === 0}
+            onClick={() => void probeAll(outbounds)}
+          >
+            {probingAny ? '探测中…' : '测全部'}
+          </Button>
+        </CardHeader>
+        <CardContent>
+          {outbounds.length === 0 ? (
+            <p className="text-muted-foreground text-sm">暂无远端出站（实例未拉起或配置未下发）</p>
+          ) : (
+            <div className="space-y-5">
+              {groupOutbounds(outbounds).map((group) => (
+                <section key={group.protocol} className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-muted-foreground text-xs font-semibold tracking-wider uppercase">
+                      {protocolLabel(group.protocol)}
+                    </h3>
+                    <span className="text-muted-foreground tabular-nums text-xs">{group.items.length}</span>
+                    <div className="bg-border h-px min-w-4 flex-1" />
+                  </div>
+                  <div className="space-y-2">
+                    {group.items.map((ob) => {
+                      const key = reachKey(ob.server_key, ob.tag)
+                      const reach = reachByKey[key]
+                      const probing = !!probingKeys[key]
+                      return (
+                        <div
+                          key={key}
+                          className="border-border bg-muted/20 flex flex-col gap-2 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between"
+                        >
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-mono text-sm font-medium">{ob.tag}</span>
+                              {ob.server_key ? (
+                                <span className="text-muted-foreground font-mono text-xs">{ob.server_key}</span>
+                              ) : null}
+                            </div>
+                            <p className="text-muted-foreground text-xs break-all">
+                              {[outboundEndpoint(ob), outboundTransport(ob)].filter(Boolean).join(' · ') ||
+                                '无远端地址'}
+                            </p>
+                            {reach?.tcp && !reach.tcp.ok && reach.tcp.error ? (
+                              <p className="text-destructive text-xs break-all">TCP：{reach.tcp.error}</p>
+                            ) : null}
+                            {reach?.protocol_cn && !reach.protocol_cn.ok && reach.protocol_cn.error ? (
+                              <p className="text-destructive text-xs break-all">国内：{reach.protocol_cn.error}</p>
+                            ) : null}
+                            {reach?.protocol_foreign && !reach.protocol_foreign.ok && reach.protocol_foreign.error ? (
+                              <p className="text-destructive text-xs break-all">境外：{reach.protocol_foreign.error}</p>
+                            ) : null}
+                          </div>
+                          <div className="flex shrink-0 flex-wrap items-center gap-2">
+                            <ProbeBadge label="TCP" probing={probing} leg={reach?.tcp} />
+                            <ProbeBadge label="国内" probing={probing} leg={reach?.protocol_cn} />
+                            <ProbeBadge label="境外" probing={probing} leg={reach?.protocol_foreign} />
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              disabled={probing || restarting || stopping}
+                              onClick={() => void probeOne(ob)}
+                            >
+                              {probing ? '测…' : '测'}
+                            </Button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </section>
               ))}
             </div>
           )}
@@ -360,7 +422,10 @@ export default function StatusPage() {
         </CardHeader>
         <CardContent className="space-y-3">
           <DetailRow label="Rocket 地址" value={status.addr} />
-          <DetailRow label="本地后台" value={status.admin_port ? `http://127.0.0.1:${status.admin_port}` : undefined} />
+          <DetailRow
+            label="本地后台"
+            value={status.admin_port ? `http://127.0.0.1:${status.admin_port}` : undefined}
+          />
           <DetailRow label="客户端标记" value={status.client_build} />
           <DetailRow label="可执行文件" value={status.exe_path} />
           <DetailRow label="系统" value={status.os} />
@@ -369,130 +434,38 @@ export default function StatusPage() {
           <DetailRow label="连接时间" value={status.connected_at} />
           <DetailRow label="启动时间" value={status.started_at} />
           <DetailRow label="配置路径" value={status.config_path} />
-          {status.last_error && (
+          {showElevated ? (
+            <DetailRow label="权限" value={status.elevated ? '已提权' : '未提权'} />
+          ) : null}
+          {showElevated || showLoginAutostart ? (
+            <DetailRow
+              label="登录自启"
+              value={status.autostart_installed ? '已注册' : '未注册'}
+            />
+          ) : null}
+          {status.last_error ? (
             <>
               <Separator />
               <p className="text-destructive text-sm break-all">最近错误: {status.last_error}</p>
             </>
-          )}
+          ) : null}
         </CardContent>
       </Card>
 
-      {showElevatedAuth && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Shield className="size-4" />
-              权限与自启
-            </CardTitle>
-            <CardDescription>
-              Windows 需管理员权限才能开 TUN；开启后登录自动提权，也可立即提权重启
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <StatusBadge ok={!!status.elevated} okLabel="已提权" failLabel="未提权" />
-              <StatusBadge
-                ok={!!status.autostart_installed}
-                okLabel="提权自启已开"
-                failLabel="提权自启未开"
-              />
-            </div>
-            <DetailRow label="当前权限" value={status.elevated ? '管理员' : '普通用户'} />
-            <DetailRow
-              label="登录自启"
-              value={status.autostart_installed ? '已注册（最高权限）' : '未注册'}
-            />
-            <div className="flex flex-wrap gap-2">
-              {!status.autostart_installed ? (
-                <Button onClick={handleInstallAutostart} disabled={autostartLoading}>
-                  开启提权自启
-                </Button>
-              ) : (
-                <Button variant="outline" onClick={handleUninstallAutostart} disabled={autostartLoading}>
-                  关闭提权自启
-                </Button>
-              )}
-              {!status.elevated && (
-                <Button
-                  variant="secondary"
-                  onClick={handleRelaunchAutostart}
-                  disabled={autostartLoading || !status.autostart_installed}
-                >
-                  立即提权重启
-                </Button>
-              )}
-            </div>
-            {!status.elevated && !status.autostart_installed && (
-              <p className="text-muted-foreground text-xs">
-                点「开启提权自启」会弹出 UAC 确认；完成后可再点「立即提权重启」
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      {showLoginAutostart && !showElevatedAuth && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Shield className="size-4" />
-              登录自启
-            </CardTitle>
-            <CardDescription>注册 LaunchAgent，登录后自动拉起 rocket</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <StatusBadge
-              ok={!!status.autostart_installed}
-              okLabel="已开启登录自启"
-              failLabel="未开启登录自启"
-            />
-            <div className="flex flex-wrap gap-2">
-              {!status.autostart_installed ? (
-                <Button onClick={handleInstallAutostart} disabled={autostartLoading}>
-                  开启登录自启
-                </Button>
-              ) : (
-                <Button variant="outline" onClick={handleUninstallAutostart} disabled={autostartLoading}>
-                  关闭登录自启
-                </Button>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
       <Card>
         <CardHeader>
-          <CardTitle>TUN 模式</CardTitle>
-          <CardDescription>
-            {isDarwin
-              ? '公网流量先进 TUN，再按路由规则分流；需先安装 Privileged Helper'
-              : isWindows
-                ? '公网流量先进 TUN（wintun），再按路由规则分流；需管理员权限'
-                : '公网流量先进 TUN，再按路由规则分流'}
-          </CardDescription>
+          <CardTitle>TUN 快照</CardTitle>
+          <CardDescription>运行态只读；开关与 Helper 在「TUN」页操作</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <DetailRow label="运行状态" value={status.tun_enabled ? '网卡已拉起' : '未运行'} />
           <DetailRow label="本地开关" value={status.tun_local_use ? '已开启' : '已关闭'} />
           <DetailRow label="TUN 拥有者" value={status.tun_owner_key || undefined} />
-          <DetailRow
-            label="TUN 生效"
-            value={
-              status.tun_local_use
-                ? status.tun_active
-                  ? '是'
-                  : status.tun_degraded_reason
-                    ? `否（${status.tun_degraded_reason}）`
-                    : '否'
-                : undefined
-            }
-          />
+          <DetailRow label="流量劫持" value={tunHijackValue(status)} />
           <DetailRow label="服务端模板" value={status.tun_in_config ? '含 services.tun' : '未下发'} />
-          {showHelper && (
+          {showHelper ? (
             <DetailRow label="Helper" value={status.tun_helper_installed ? '已安装' : '未安装'} />
-          )}
+          ) : null}
           <DetailRow label="接口" value={status.tun_if_name} />
           <DetailRow
             label="出站绑网卡"
@@ -504,82 +477,6 @@ export default function StatusPage() {
                 : undefined
             }
           />
-          <div className="flex flex-wrap gap-2">
-            {showHelper && !status.tun_helper_installed && (
-              <Button variant="outline" onClick={handleInstallHelper} disabled={tunLoading}>
-                安装 Helper
-              </Button>
-            )}
-            {showHelper && status.tun_helper_installed && (
-              <Button variant="outline" onClick={handleUninstallHelper} disabled={tunLoading}>
-                拆卸 Helper
-              </Button>
-            )}
-            <Button
-              onClick={handleTunToggle}
-              disabled={!status.agent_ready || tunLoading}
-            >
-              {status.tun_enabled ? '关闭 TUN' : '开启 TUN'}
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <CardTitle>一键排查</CardTitle>
-              <CardDescription>权限、TUN、DNS、连通性等完整检测日志</CardDescription>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={handleDiagnose} disabled={diagLoading} variant="secondary">
-                <Stethoscope className={diagLoading ? 'animate-pulse' : ''} />
-                {diagLoading ? '排查中…' : '开始排查'}
-              </Button>
-              <Button
-                variant="outline"
-                onClick={handleCopyDiagLog}
-                disabled={!diagLog || diagLoading}
-              >
-                <Copy />
-                复制日志
-              </Button>
-              <Button onClick={handleReconnect} disabled={!status.agent_ready || loading}>
-                <RefreshCw className={loading ? 'animate-spin' : ''} />
-                立即重连
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {diag && (
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge variant={diag.ok ? 'success' : 'destructive'}>
-                  {diag.ok ? '全部通过' : '存在失败项'}
-                </Badge>
-                {diag.cause && (
-                  <Badge variant="outline">{diag.cause}</Badge>
-                )}
-                <span className="text-muted-foreground text-xs">{diag.summary}</span>
-              </div>
-              {diag.verdict && (
-                <div className="rounded-lg border border-amber-900/50 bg-amber-950/40 px-3 py-2 text-sm text-amber-100">
-                  <div className="font-medium">根因：{diag.verdict}</div>
-                  {diag.fix && (
-                    <div className="mt-1 text-xs text-amber-200/80">建议：{diag.fix}</div>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-          <pre
-            ref={diagLogRef}
-            className="max-h-[28rem] overflow-auto rounded-lg border border-zinc-800 bg-zinc-950 p-4 font-mono text-xs leading-5 break-all whitespace-pre-wrap text-zinc-100"
-          >
-            {diagLog || '# 点击「开始排查」后，完整检测过程会输出在这里'}
-          </pre>
         </CardContent>
       </Card>
     </div>

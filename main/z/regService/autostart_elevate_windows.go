@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+
+	"github.com/v2fly/v2ray-core/v5/main/z/winutil"
 )
 
 func runElevatedWait(arg string) error {
@@ -19,7 +21,7 @@ func runElevatedWait(arg string) error {
 		strings.ReplaceAll(exe, `'`, `''`),
 		arg,
 	)
-	cmd := exec.Command("powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps)
+	cmd := exec.Command(winutil.System32("powershell"), "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	out, err := cmd.CombinedOutput()
 	if err != nil {

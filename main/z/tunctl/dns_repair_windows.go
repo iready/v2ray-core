@@ -5,13 +5,19 @@ package tunctl
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/v2fly/v2ray-core/v5/main/z/winutil"
 )
 
 const createNoWindow = 0x08000000
 
 func runHidden(name string, args ...string) ([]byte, error) {
+	if !filepath.IsAbs(name) && !strings.ContainsAny(name, `/\`) {
+		name = winutil.System32(name)
+	}
 	cmd := exec.Command(name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	return cmd.CombinedOutput()

@@ -94,14 +94,16 @@ print_usage() {
   cat <<'EOF'
 用法: ./build.sh [选项]
 
-  --os <target>     目标平台: windows（默认）| darwin | linux | all
-  -r, --reuse-last  沿用上次/默认构建选择，全程无提问
-  -h, --help        显示此帮助
+  --os <target>         目标平台: windows（默认）| darwin | linux | all
+  -r, --reuse-last      沿用上次/默认构建选择，全程无提问
+  --install-startup     Windows：编完后覆盖 Startup\rocket.exe、拉起、等后台就绪
+  -h, --help            显示此帮助
 
 示例:
   ./build.sh -r                 # 仅 Windows，沿用上次选择
   ./build.sh --os windows -r    # 同上
   ./build.sh --os all -r        # 全平台
+  ./build.sh --os windows -r --install-startup
 
 无参数时：若存在 .build.prefs.local 则只问一次是否沿用上次全部选择。
 EOF
@@ -124,8 +126,135 @@ target_enabled() {
   [[ "$TARGET" == "all" || "$TARGET" == "$1" ]]
 }
 
+is_windows_host() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW* | MSYS* | CYGWIN*) return 0 ;;
+  esac
+  [[ "${OS:-}" == "Windows_NT" ]]
+}
+
+# Git Bash 里 go/yarn 跑完后 PATH 经常丢 System32，cmd.exe 会变 command not found。
+windows_sys32() {
+  local s
+  s="$(cygpath -S 2>/dev/null || true)"
+  if [[ -n "$s" ]]; then
+    cygpath -u "$s"
+    return
+  fi
+  echo "/c/Windows/System32"
+}
+
+windows_root() {
+  local s
+  s="$(cygpath -W 2>/dev/null || true)"
+  if [[ -n "$s" ]]; then
+    cygpath -u "$s"
+    return
+  fi
+  echo "/c/Windows"
+}
+
+win32() {
+  local exe="$1"
+  shift
+  local bin
+  case "$exe" in
+    explorer.exe) bin="$(windows_root)/explorer.exe" ;;
+    *) bin="$(windows_sys32)/$exe" ;;
+  esac
+  MSYS_NO_PATHCONV=1 "$bin" "$@"
+}
+
+# qc / Git Bash 经常只有 Go，没有 System32；后面 win32 和装上的 rocket 都要。
+ensure_windows_system_path() {
+  is_windows_host || return 0
+  local sys32
+  sys32="$(windows_sys32)"
+  PATH="$sys32:$sys32/WindowsPowerShell/v1.0:$PATH"
+  export PATH
+}
+
+rocket_exe_running() {
+  win32 tasklist.exe /FI "IMAGENAME eq rocket.exe" 2>/dev/null | grep -qi rocket.exe
+}
+
+# 本机 Windows 编 rocket.exe 时，正在跑的进程会锁文件导致 go build / upx 失败。
+stop_running_rocket_exe() {
+  local f="$SCRIPT_DIR/build/rocket.exe"
+  echo "结束本机 rocket.exe ..."
+  if rocket_exe_running; then
+    win32 taskkill.exe /F /IM rocket.exe /T >/dev/null 2>&1 || true
+  fi
+  local i
+  for i in $(seq 1 30); do
+    rocket_exe_running || break
+    sleep 1
+  done
+  if rocket_exe_running; then
+    echo "rocket.exe 仍在运行，无法覆盖" >&2
+    exit 1
+  fi
+  [[ -f "$f" ]] || return 0
+  for i in $(seq 1 20); do
+    if mv -f "$f" "$f.unlock" 2>/dev/null; then
+      mv -f "$f.unlock" "$f"
+      return 0
+    fi
+    echo "build/rocket.exe 仍被占用 (${i}s)"
+    sleep 1
+  done
+  echo "build/rocket.exe 仍被占用，无法覆盖" >&2
+  exit 1
+}
+
+install_windows_startup() {
+  local src="$SCRIPT_DIR/build/rocket.exe"
+  local dest="${APPDATA}/Microsoft/Windows/Start Menu/Programs/Startup/rocket.exe"
+  local dest_win
+  [[ -f "$src" ]] || { echo "缺少 $src" >&2; exit 1; }
+  mkdir -p "$(dirname "$dest")"
+  cp -f "$src" "$dest"
+  dest_win="$(cygpath -w "$dest")"
+  echo "已写入 $dest_win"
+  # 用 bat 拉起：Git Bash 直接 cmd /c start 会把引号吃成找 \\。
+  local bat bat_win
+  bat="${TEMP:-/tmp}/rocket-start-$$.bat"
+  bat_win="$(cygpath -w "$bat")"
+  printf 'set PATH=%%SystemRoot%%\\System32;%%SystemRoot%%\\System32\\Wbem;%%SystemRoot%%\\System32\\WindowsPowerShell\\v1.0\r\nstart "" "%s"\r\n' "$dest_win" >"$bat"
+  win32 cmd.exe /c "$bat_win"
+  rm -f "$bat"
+  local i
+  for i in $(seq 1 45); do
+    if curl -fsS --max-time 2 http://127.0.0.1:19527/api/status >/dev/null 2>&1; then
+      echo "rocket admin ok (${i}s)"
+      win32 explorer.exe /select,"$dest_win"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "rocket admin 未就绪" >&2
+  exit 1
+}
+
+# 覆盖本机 GOTOOLCHAIN=local / GOSUMDB=off，按 go.mod 的 toolchain 拉对应 Go。
+ensure_go_toolchain() {
+  local toolchain sumdb
+  toolchain=$(awk '/^toolchain[[:space:]]/{print $2; exit}' "$SCRIPT_DIR/go.mod")
+  if [[ -z "$toolchain" ]]; then
+    return 0
+  fi
+  # 必须先读 GOSUMDB：一旦 export GOTOOLCHAIN，go env 会去拉 toolchain，GOSUMDB=off 会直接失败。
+  sumdb=$(go env GOSUMDB 2>/dev/null || true)
+  export GOTOOLCHAIN="$toolchain"
+  if [[ "$sumdb" == "off" ]]; then
+    export GOSUMDB=sum.golang.google.cn
+  fi
+  echo "Go toolchain: $GOTOOLCHAIN"
+}
+
 parse_args() {
   CLI_TARGET=""
+  INSTALL_STARTUP=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --os)
@@ -140,6 +269,7 @@ parse_args() {
         shift
         ;;
       -r | --reuse-last) REUSE_LAST=1; shift ;;
+      --install-startup) INSTALL_STARTUP=1; shift ;;
       -h | --help) print_usage; exit 0 ;;
       *)
         echo "未知参数: $1"
@@ -329,6 +459,7 @@ apply_build_ldflags() {
 BUILD_FLAGS="-trimpath -tags with_gvisor"
 
 parse_args "$@"
+ensure_windows_system_path
 
 # 创建构建目录
 mkdir -p build
@@ -445,27 +576,33 @@ HELPER_PKG=github.com/v2fly/v2ray-core/v5/main/z/cmd/v2ray-helper
 BUILT_LINUX=0
 BUILT_WINDOWS=0
 
+ensure_go_toolchain
+
 if target_enabled darwin; then
   echo "构建 macOS ARM64..."
-  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket "$CLIENT_PKG"
-  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper "$HELPER_PKG"
+  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket "$CLIENT_PKG" || exit 1
+  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper "$HELPER_PKG" || exit 1
   # launchd plist 已 go:embed 进 rocket，安装 Helper 时写出，无需旁路拷贝 plist。
 
   echo "构建 macOS x86_64..."
-  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-darwin-x86 "$CLIENT_PKG"
-  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper-darwin-x86 "$HELPER_PKG"
+  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-darwin-x86 "$CLIENT_PKG" || exit 1
+  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper-darwin-x86 "$HELPER_PKG" || exit 1
 fi
 
 if target_enabled linux; then
   echo "构建 Linux x86_64..."
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-linux "$CLIENT_PKG"
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-linux "$CLIENT_PKG" || exit 1
   BUILT_LINUX=1
 fi
 
 if target_enabled windows; then
+  WIN_OUT="${WIN_OUT:-build/rocket.exe}"
+  if is_windows_host && [[ "$WIN_OUT" == "build/rocket.exe" ]]; then
+    stop_running_rocket_exe
+  fi
   # -H windowsgui：无控制台黑框
   echo "构建 Windows x86_64..."
-  CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS -H windowsgui" -o build/rocket.exe "$CLIENT_PKG"
+  CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS -H windowsgui" -o "$WIN_OUT" "$CLIENT_PKG" || exit 1
   BUILT_WINDOWS=1
 fi
 
@@ -474,7 +611,7 @@ if [[ $RUN_UPX -eq 1 ]]; then
   if command -v upx >/dev/null 2>&1; then
     echo "检测到 upx，开始二次压缩（跳过 macOS）..."
     [[ $BUILT_LINUX -eq 1 ]] && upx --best --lzma build/rocket-linux || true
-    [[ $BUILT_WINDOWS -eq 1 ]] && upx --best --lzma build/rocket.exe || true
+    [[ $BUILT_WINDOWS -eq 1 ]] && upx --best --lzma "${WIN_OUT:-build/rocket.exe}" || true
   else
     echo "未检测到 upx，跳过二次压缩。"
   fi
@@ -509,3 +646,11 @@ fi
 echo "构建完成！目标=$TARGET"
 echo "构建文件："
 ls -la build/
+
+if [[ ${INSTALL_STARTUP:-0} -eq 1 ]]; then
+  if [[ ${BUILT_WINDOWS:-0} -ne 1 ]]; then
+    echo "--install-startup 需要本次编出 Windows（--os windows|all）" >&2
+    exit 1
+  fi
+  install_windows_startup
+fi

@@ -76,9 +76,9 @@ export default function LogPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">v2ray 日志</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">核心日志</h1>
         <p className="text-muted-foreground mt-1 text-sm">
-          本地覆盖优先于 Rocket 服务端下发的 log 配置；仅影响 v2ray 实例，不影响 rocket 进程自身日志。
+          本地覆盖优先于服务端下发的 log 配置；仅影响核心实例，不影响本进程自身日志。
         </p>
       </div>
 
