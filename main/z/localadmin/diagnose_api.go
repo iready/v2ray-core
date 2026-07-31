@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/v2fly/v2ray-core/v5/app/tun/singtun"
 	"github.com/v2fly/v2ray-core/v5/main/z/rocket"
 	"github.com/v2fly/v2ray-core/v5/main/z/tunctl"
 	"github.com/v2fly/v2ray-core/v5/main/z/wire"
@@ -102,15 +103,23 @@ func (h *Handler) runDiagnose() DiagnoseReport {
 	if addr := strings.TrimSpace(snap.Addr); addr != "" {
 		host := wire.HostFromURL(addr)
 		if host != "" {
-			port := "443"
-			if strings.Contains(host, ":") {
-				h2, p, err := net.SplitHostPort(host)
-				if err == nil {
-					host, port = h2, p
-				}
+			port := wire.PortFromURL(addr)
+			if port == "" {
+				port = "443"
 			}
-			checks = append(checks, checkTCP("wire_host", "Rocket 控制面 "+host+":"+port, net.JoinHostPort(host, port),
-				"控制面不通：无法拉配置/重连，检查防火墙或服务端"))
+			// Linux Docker：TUN 改 resolv 后容器名可能短时不可解析；Wire 已通则控制面实测已通。
+			if runtime.GOOS == "linux" && snap.WireConnected {
+				checks = append(checks, DiagnoseCheck{
+					ID:     "wire_host",
+					Title:  "Rocket 控制面 " + host + ":" + port,
+					OK:     true,
+					Level:  "ok",
+					Detail: "Wire 已连接（跳过主机名重解析）",
+				})
+			} else {
+				checks = append(checks, checkTCP("wire_host", "Rocket 控制面 "+host+":"+port, net.JoinHostPort(host, port),
+					"控制面不通：无法拉配置/重连，检查防火墙或服务端"))
+			}
 		}
 	}
 
@@ -377,17 +386,6 @@ func diagnoseHTTPClient() *http.Client {
 	}
 }
 
-func isFakeDNSIP(ip string) bool {
-	addr, err := netip.ParseAddr(ip)
-	if err != nil {
-		return false
-	}
-	// sing-tun 默认池 198.18.0.0/16；路由里也按 /15 覆盖。
-	p16, _ := netip.ParsePrefix("198.18.0.0/16")
-	p15, _ := netip.ParsePrefix("198.18.0.0/15")
-	return p16.Contains(addr) || p15.Contains(addr)
-}
-
 func resolveHostIPs(host string) (ips []string, fake bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -397,7 +395,7 @@ func resolveHostIPs(host string) (ips []string, fake bool) {
 	}
 	for _, a := range addrs {
 		ips = append(ips, a)
-		if isFakeDNSIP(a) {
+		if addr, err := netip.ParseAddr(a); err == nil && singtun.IsFakeDNSAddr(addr) {
 			fake = true
 		}
 	}
@@ -483,14 +481,26 @@ func checkForeignIPProxy(snap StatusSnapshot) DiagnoseCheck {
 	return ch
 }
 
-// checkCNDNS TUN 开启时测本机 DNS（127.0.0.1→dokodemo→国内解析）；关闭时仍测到 223.5.5.5 的 TCP。
+// localCNDNSTarget TUN 开启时本机 DNS 探测地址（按平台实际劫持目标）。
+func localCNDNSTarget() string {
+	switch runtime.GOOS {
+	case "linux", "windows":
+		return "127.0.0.1:53"
+	default:
+		// Darwin：helper 监听 :53，转发到 53535 dokodemo。
+		return "127.0.0.1:53"
+	}
+}
+
+// checkCNDNS TUN 开启时测本机 DNS（平台 DNS 劫持→国内解析）；关闭时仍测到 223.5.5.5 的 TCP。
 func checkCNDNS(snap StatusSnapshot) DiagnoseCheck {
 	start := time.Now()
 	tunOn := snap.TunActive || snap.TunEnabled
 	if tunOn {
+		target := localCNDNSTarget()
 		ch := DiagnoseCheck{
 			ID:    "direct_dns",
-			Title: "国内 DNS (via 127.0.0.1:53)",
+			Title: "国内 DNS (via " + target + ")",
 			Hint:  cnDNSHint(snap),
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
@@ -499,7 +509,7 @@ func checkCNDNS(snap StatusSnapshot) DiagnoseCheck {
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				d := net.Dialer{Timeout: 2 * time.Second}
-				return d.DialContext(ctx, "udp", "127.0.0.1:53")
+				return d.DialContext(ctx, "udp", target)
 			},
 		}
 		ips, err := r.LookupHost(ctx, "www.baidu.com")
@@ -520,9 +530,16 @@ func checkCNDNS(snap StatusSnapshot) DiagnoseCheck {
 
 func cnDNSHint(snap StatusSnapshot) string {
 	if snap.TunActive || snap.TunEnabled {
-		return "开 TUN 仍失败：本机 :53 dokodemo/国内 tcp+local DNS 未通；可关开 TUN 或重启"
+		switch runtime.GOOS {
+		case "darwin":
+			return "开 TUN 仍失败：本机 :53 dokodemo/国内 https+local DNS 未通；可关开 TUN 或重启"
+		case "linux":
+			return "开 TUN 仍失败：resolv.conf 未指 127.0.0.1 或本机 :53 dokodemo/国内 tcp+local 未通；可关开 TUN 或重启"
+		default:
+			return "开 TUN 仍失败：本机 dokodemo/国内 tcp+local DNS 未通；可关开 TUN 或重启"
+		}
 	}
-	return "失败时常见于 DNS 残留 127.0.0.1、未提权、或本机网络拦 223.5.5.5"
+	return "失败时常见于 DNS 残留、未提权、或本机网络拦 223.5.5.5"
 }
 
 func cnHTTPSHint(snap StatusSnapshot) string {
@@ -627,7 +644,7 @@ func synthesizeVerdict(tunOn bool, byID map[string]DiagnoseCheck) (verdict, caus
 	case !cnDNS && (proxyHTTP || hasFakeDNSNote(byID, "https_proxy")):
 		return "国内 DNS 上游挂了：外网靠 FakeDNS 假 IP，国内站/真域名解析失败",
 			"cn_dns_upstream",
-			"确认包含 tcp+local://223.5.5.5；关开 TUN；看客户端标记是否最新"
+			"确认国内 DNS 上游（Darwin 默认 https+local、Linux/Windows 默认 tcp+local）；关开 TUN；看客户端标记是否最新"
 	case !cnHTTP && !proxyHTTP:
 		return "国内外 HTTPS 都挂：TUN 总出口或本机 DNS 全挂",
 			"tun_total",

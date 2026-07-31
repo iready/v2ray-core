@@ -61,8 +61,9 @@ func BuildBypassPlan(profile rvstore.TunProfile, wireURL string, configJSONs ...
 	}
 	excludes = append(excludes, classified.Prefixes...)
 	// 国内 DNS 上游始终绕行/排除（不依赖 config 是否已含 services.tun）。
-	hosts = append(hosts, "223.5.5.5")
-	if p, err := netip.ParsePrefix("223.5.5.5/32"); err == nil {
+	cnHost := profile.EffectiveCNResolverHost()
+	hosts = append(hosts, cnHost)
+	if p, err := netip.ParsePrefix(cnHost + "/32"); err == nil {
 		excludes = append(excludes, p)
 	}
 	for _, raw := range configJSONs {
@@ -92,12 +93,15 @@ func BuildBypassPlan(profile rvstore.TunProfile, wireURL string, configJSONs ...
 }
 
 func lanBypassNetworks() []string {
-	return []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"169.254.0.0/16",
+	// 与 singtun.DefaultRouteExcludeCIDRs 对齐，但不写 127.0.0.0/8（会破坏 lo0）。
+	var nets []string
+	for _, cidr := range singtun.DefaultRouteExcludeCIDRs {
+		if cidr == "127.0.0.0/8" {
+			continue
+		}
+		nets = append(nets, cidr)
 	}
+	return nets
 }
 
 func resolveWireHosts(wireURL string) []string {

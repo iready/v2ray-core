@@ -35,3 +35,12 @@ func HostFromURL(raw string) string {
 	}
 	return u.Hostname()
 }
+
+// PortFromURL 解析显式端口；未写则空串（由调用方按协议默认）。
+func PortFromURL(raw string) string {
+	u, err := url.Parse(normalizeWSURL(raw))
+	if err != nil {
+		return ""
+	}
+	return u.Port()
+}

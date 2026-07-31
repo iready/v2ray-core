@@ -142,6 +142,11 @@ export interface TunProfile {
   bind_interface?: string
   bind_interface_candidates?: string[]
   bind_interface_effective?: string
+  cn_dns?: string
+  cn_dns_default?: string
+  remote_dns?: string
+  remote_dns_default?: string
+  fakedns_domains?: string[]
   bypass_rocket_server?: boolean
   bypass_lan?: boolean
   bypass_loopback?: boolean

@@ -336,17 +336,19 @@ func (m *Manager) ensureBypassHost(host string) {
 	if host == "" {
 		return
 	}
+	m.mu.Lock()
 	for _, h := range m.bypassHosts {
 		if h == host {
+			m.mu.Unlock()
 			return
 		}
 	}
 	m.bypassHosts = append(m.bypassHosts, host)
 	m.bypassPlan.Hosts = append(m.bypassPlan.Hosts, host)
-	if !m.active || m.ifName == "" {
-		return
-	}
-	if m.bypassApplied {
+	needAdd := m.active && m.ifName != "" && m.bypassApplied
+	m.mu.Unlock()
+	// IPC 不持锁，避免出站 dial 堵住 Suspend/ApplyRoutes。
+	if needAdd {
 		_ = m.client.AddBypassHost(host)
 	}
 }

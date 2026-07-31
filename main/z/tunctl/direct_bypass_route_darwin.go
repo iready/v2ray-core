@@ -3,43 +3,37 @@
 package tunctl
 
 import (
-	"context"
 	"net"
 	"net/netip"
 	"strings"
-	"time"
 )
 
 func ensureDirectBypassRoute(network, address string) {
 	if strings.TrimSpace(network) == "" {
 		return
 	}
-	host := address
-	if h, _, err := net.SplitHostPort(address); err == nil {
-		host = h
-	}
-	host = strings.TrimSpace(host)
+	host := dialHost(address)
 	if host == "" {
 		return
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		ensureChinaBypassForIP(ip)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// 禁止在 dial 路径做系统 DNS：TUN 下系统 DNS=127.0.0.1→dokodemo→dns-out，
+		// 出站 dial 再 LookupIP 会自引用死锁，DNS 全挂。
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
-	if err != nil {
-		return
-	}
-	for _, ip := range ips {
-		ensureChinaBypassForIP(ip)
-	}
+	ensureChinaBypassForIP(ip)
 }
 
 func ensureChinaBypassForIP(ip net.IP) {
 	addr, ok := netipAddrFromIP(ip)
-	if !ok || !isChinaIP(addr) {
+	if ok {
+		prepareChinaOutboundBypass(addr)
+	}
+}
+
+func prepareChinaOutboundBypass(addr netip.Addr) {
+	if !isChinaIP(addr) {
 		return
 	}
 	defaultManager.ensureBypassHost(addr.String())
@@ -55,11 +49,4 @@ func netipAddrFromIP(ip net.IP) (netip.Addr, bool) {
 		return netip.AddrFrom16(a), true
 	}
 	return netip.Addr{}, false
-}
-
-func prepareChinaOutboundBypass(addr netip.Addr) {
-	if !isChinaIP(addr) {
-		return
-	}
-	defaultManager.ensureBypassHost(addr.String())
 }

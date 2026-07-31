@@ -1,14 +1,28 @@
 package singtun
 
-import "net/netip"
+import (
+	"fmt"
+	"net/netip"
+)
 
 // DefaultRouteExcludeCIDRs 默认不从 TUN 接管的网段（回环、私网、链路本地）。
-var DefaultRouteExcludeCIDRs = []string{
-	"127.0.0.0/8",
-	"10.0.0.0/8",
-	"172.16.0.0/12",
-	"192.168.0.0/16",
-	"169.254.0.0/16",
+// 172.16/12 拆成 /16 并排除 172.19，避免与 DefaultTunIPv4（172.19.0.1/30）重叠。
+var DefaultRouteExcludeCIDRs = buildDefaultRouteExcludeCIDRs()
+
+func buildDefaultRouteExcludeCIDRs() []string {
+	out := []string{
+		"127.0.0.0/8",
+		"10.0.0.0/8",
+		"192.168.0.0/16",
+		"169.254.0.0/16",
+	}
+	for i := 16; i <= 31; i++ {
+		if i == 19 {
+			continue // TUN 默认段
+		}
+		out = append(out, fmt.Sprintf("172.%d.0.0/16", i))
+	}
+	return out
 }
 
 // DefaultRouteExcludePrefixes 解析后的前缀列表，供 sing-tun 与 handler 使用。

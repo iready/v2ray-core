@@ -88,17 +88,36 @@ func (m *Manager) Enable(name string, mtu uint32) error {
 func (m *Manager) Disable() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	clearLinuxFakeDNSRoute()
+	restoreLinuxTunDNS()
 	singtun.ResetPlatform()
 	singtun.ClearBypassDecisionCache()
 	m.active = false
 	return nil
 }
 
-func (m *Manager) ApplyRoutes() error { return nil }
+func (m *Manager) ApplyRoutes() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active {
+		return nil
+	}
+	return ensureLinuxFakeDNSRoute()
+}
 
-func (m *Manager) ApplyDNS() error { return nil }
+func (m *Manager) ApplyDNS() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.active {
+		return nil
+	}
+	if err := applyLinuxTunDNS(); err != nil {
+		return err
+	}
+	return ensureLinuxFakeDNSRoute()
+}
 
-func (m *Manager) RefreshDNS() error { return nil }
+func (m *Manager) RefreshDNS() error { return m.ApplyDNS() }
 
 func (m *Manager) SuspendRoutes() error { return nil }
 

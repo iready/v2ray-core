@@ -69,13 +69,11 @@ func (h *Handler) PrepareConnection(network string, source M.Socksaddr, destinat
 	if network == N.NetworkUDP && shouldDropUDP(destination) {
 		return nil, stun.ErrDrop
 	}
-	if destAddr.IsValid() && h.shouldBypass(destAddr) {
-		if network == N.NetworkICMP {
-			return ping.ConnectDestination(context.Background(), nopLogger{}, nil, destAddr, routeContext, timeout)
-		}
-		return nil, stun.ErrBypass
+	// FakeDNS 池必须进 userspace（嗅探改写域名）；gvisor 对 ErrBypass 会 RST → connection refused。
+	if IsFakeDNSAddr(destAddr) {
+		return nil, nil
 	}
-	if h.shouldBypassPreMatch(network, source, destination) {
+	if (destAddr.IsValid() && h.shouldBypass(destAddr)) || h.shouldBypassPreMatch(network, source, destination) {
 		if network == N.NetworkICMP {
 			return ping.ConnectDestination(context.Background(), nopLogger{}, nil, destAddr, routeContext, timeout)
 		}

@@ -119,6 +119,7 @@ func ensureTunFinalDirectRule(doc map[string]interface{}, tunTag, directTag stri
 }
 
 // ensureTunNonCNIPProxyRule 真 IP 访问时域名/嗅探常未命中，geoip:!cn 走代理，避免 Google 等直连空响应。
+// FakeDNS 198.18/15 必须显式进代理：geoip 可能不收录该段，嗅探未改写时会落到 catch-all direct。
 func ensureTunNonCNIPProxyRule(doc map[string]interface{}, tunTag string) {
 	proxyTag := preferTUNProxyOutboundTag(doc)
 	if proxyTag == "" {
@@ -130,6 +131,7 @@ func ensureTunNonCNIPProxyRule(doc map[string]interface{}, tunTag string) {
 		doc["routing"] = routing
 	}
 	rules, _ := routing["rules"].([]interface{})
+	const fakeDNSPool = "198.18.0.0/15"
 	for _, item := range rules {
 		rule, ok := item.(map[string]interface{})
 		if !ok {
@@ -141,14 +143,18 @@ func ensureTunNonCNIPProxyRule(doc map[string]interface{}, tunTag string) {
 		if asString(rule["outboundTag"]) != proxyTag {
 			continue
 		}
-		if ruleHasIP(rule, "geoip:!cn") {
-			return
+		if !ruleHasIP(rule, "geoip:!cn") {
+			continue
 		}
+		if !ruleHasIP(rule, fakeDNSPool) {
+			rule["ip"] = appendIPList(rule["ip"], fakeDNSPool)
+		}
+		return
 	}
 	insert := map[string]interface{}{
 		"type":        "field",
 		"inboundTag":  []interface{}{tunTag},
-		"ip":          []interface{}{"geoip:!cn", "198.18.0.0/15"},
+		"ip":          []interface{}{"geoip:!cn", fakeDNSPool},
 		"outboundTag": proxyTag,
 	}
 	if i := indexTunCatchAll(rules, tunTag); i >= 0 {
@@ -157,6 +163,20 @@ func ensureTunNonCNIPProxyRule(doc map[string]interface{}, tunTag string) {
 		rules = append(rules, insert)
 	}
 	routing["rules"] = rules
+}
+
+func appendIPList(raw interface{}, add string) []interface{} {
+	var out []interface{}
+	switch v := raw.(type) {
+	case string:
+		if v != "" {
+			out = append(out, v)
+		}
+	case []interface{}:
+		out = append(out, v...)
+	}
+	out = append(out, add)
+	return out
 }
 
 func indexTunCatchAll(rules []interface{}, tunTag string) int {
@@ -225,6 +245,7 @@ func ensureDefaultTunSniffing(tun map[string]interface{}) {
 		if sniff, ok := tun[key].(map[string]interface{}); ok && sniff != nil {
 			// 强制覆盖目标，避免仅嗅探不改写导致仍按 IP 直连
 			sniff["enabled"] = true
+			sniff["metadataOnly"] = true
 			if sniff["destination_override"] == nil && sniff["destinationOverride"] == nil {
 				sniff["destination_override"] = []interface{}{"fakedns", "http", "tls", "quic"}
 			} else {
@@ -240,6 +261,7 @@ func ensureDefaultTunSniffing(tun map[string]interface{}) {
 	}
 	tun["sniffing_settings"] = map[string]interface{}{
 		"enabled":              true,
+		"metadataOnly":         true,
 		"destination_override": []interface{}{"fakedns", "http", "tls", "quic"},
 	}
 }

@@ -195,7 +195,7 @@ func (x *RS) mergeServerJSONForItem(raw string, isOwner bool) string {
 		if policyErr != nil {
 			log.Printf("merge TUN owner policy: %v", policyErr)
 		}
-		merged, policyErr = configmerge.ApplyTunOwnerDNSPolicy(merged)
+		merged, policyErr = configmerge.ApplyTunOwnerDNSPolicy(merged, profile)
 		if policyErr != nil {
 			log.Printf("merge TUN owner DNS policy: %v", policyErr)
 		}

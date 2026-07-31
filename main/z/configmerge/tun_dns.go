@@ -7,20 +7,19 @@ import (
 	"strings"
 
 	"github.com/v2fly/v2ray-core/v5/app/tun/singtun"
+	"github.com/v2fly/v2ray-core/v5/main/z/rvstore"
 )
 
 const (
 	tunDNSOutboundTag = "dns-out"
 	tunDNSInboundTag  = "tun-dns-in"
-	// 国内 DNS 必须 tcp+local：走 DialSystem+绑网卡，不经 dispatcher，避免被 TUN/dns-out 劫持。
-	tunCNResolver = "tcp+local://223.5.5.5:53"
-	tunCNDNSTag   = "tun-dns-cn"
-	// UDP/53 经代理常不通；TCP DNS 可走代理出站。
-	tunRemoteResolver = "tcp://8.8.8.8:53"
+	tunCNDNSTag       = "tun-dns-cn"
+	tunRemoteDNSTag   = "tun-dns-remote"
 )
 
 // ApplyTunOwnerDNSPolicy 为 TUN 拥有者注入 FakeDNS、国内真实解析与 UDP/53→dns 出站路由（对齐 sing-box TUN DNS）。
-func ApplyTunOwnerDNSPolicy(raw string) (string, error) {
+// profile 中 cn_dns / remote_dns / fakedns_domains 可空（用默认）。
+func ApplyTunOwnerDNSPolicy(raw string, profile rvstore.TunProfile) (string, error) {
 	if raw == "" {
 		return raw, nil
 	}
@@ -35,7 +34,7 @@ func ApplyTunOwnerDNSPolicy(raw string) (string, error) {
 	}
 	tunTag := tunInboundTag(tun)
 	ensureDNSOutbound(doc)
-	ensureTunOwnerDNS(doc)
+	ensureTunOwnerDNS(doc, profile)
 	ensureTunDNSInbound(doc)
 	ensureTunDNSForwardRule(doc)
 	ensureTunDNSRule(doc, tunTag)
@@ -44,33 +43,38 @@ func ApplyTunOwnerDNSPolicy(raw string) (string, error) {
 	return marshalDoc(doc)
 }
 
-func ensureTunOwnerDNS(doc map[string]interface{}) {
+func ensureTunOwnerDNS(doc map[string]interface{}, profile rvstore.TunProfile) {
 	dns, _ := doc["dns"].(map[string]interface{})
 	if dns == nil {
 		dns = map[string]interface{}{}
 		doc["dns"] = dns
 	}
 	ensureFakeDNSPool(dns)
-	// 国内 → tcp+local://223.5.5.5（真直连，不经代理/TUN）；
-	// GFW/Google → FakeDNS；其余境外 → tcp://8.8.8.8 经代理。
-	const remoteTag = "tun-dns-remote"
+	cnResolver := profile.EffectiveCNResolver()
+	remoteResolver := profile.EffectiveRemoteResolver()
+	fakeDomains := profile.EffectiveFakeDNSDomains()
+	fakeDomainList := make([]interface{}, 0, len(fakeDomains))
+	for _, d := range fakeDomains {
+		fakeDomainList = append(fakeDomainList, d)
+	}
+	// 国内 → cnResolver（真直连）；FakeDNS → fakeDomains；其余境外 → remoteResolver 经代理。
 	remote := map[string]interface{}{
-		"address": tunRemoteResolver,
-		"tag":     remoteTag,
+		"address": remoteResolver,
+		"tag":     tunRemoteDNSTag,
 	}
 	if proxyTag := preferTUNProxyOutboundTag(doc); proxyTag != "" {
-		ensureDNSRemoteInboundRoute(doc, remoteTag, proxyTag)
+		ensureDNSRemoteInboundRoute(doc, tunRemoteDNSTag, proxyTag)
 	}
 	dns["servers"] = []interface{}{
 		map[string]interface{}{
-			"address":      tunCNResolver,
+			"address":      cnResolver,
 			"domains":      []interface{}{"geosite:cn"},
 			"skipFallback": true,
 			"tag":          tunCNDNSTag,
 		},
 		map[string]interface{}{
 			"address":      "fakedns",
-			"domains":      []interface{}{"geosite:gfw", "geosite:google", "geosite:youtube", "geosite:geolocation-!cn"},
+			"domains":      fakeDomainList,
 			"skipFallback": true,
 		},
 		remote,
@@ -198,13 +202,15 @@ func hasFakeDNSPool(dns map[string]interface{}) bool {
 	}
 }
 
-func ensureTunDNSServers(dns map[string]interface{}) {
+func ensureTunDNSServers(dns map[string]interface{}, cnDNS string) {
+	cnResolver := rvstore.ResolveCNResolver(cnDNS)
 	servers, _ := dns["servers"].([]interface{})
-	if !hasCNResolver(servers) {
+	if !hasCNResolver(servers, cnResolver) {
 		servers = append([]interface{}{map[string]interface{}{
-			"address":      tunCNResolver,
+			"address":      cnResolver,
 			"domains":      []interface{}{"geosite:cn"},
 			"skipFallback": true,
+			"tag":          tunCNDNSTag,
 		}}, servers...)
 	}
 	if !hasFakeDNSServer(servers) {
@@ -213,18 +219,18 @@ func ensureTunDNSServers(dns map[string]interface{}) {
 	dns["servers"] = servers
 }
 
-func hasCNResolver(servers []interface{}) bool {
+func hasCNResolver(servers []interface{}, cnResolver string) bool {
 	for _, item := range servers {
 		switch s := item.(type) {
 		case string:
-			if s == tunCNResolver {
+			if s == cnResolver {
 				return true
 			}
 		case map[string]interface{}:
-			if asString(s["address"]) != tunCNResolver {
-				continue
+			if asString(s["tag"]) == tunCNDNSTag {
+				return true
 			}
-			if serverHasDomain(s, "geosite:cn") {
+			if asString(s["address"]) == cnResolver && serverHasDomain(s, "geosite:cn") {
 				return true
 			}
 		}
@@ -280,20 +286,26 @@ func ensureDNSOutbound(doc map[string]interface{}) {
 }
 
 func ensureTunDNSInbound(doc map[string]interface{}) {
+	port := singtun.TunDNSForwardPort
+	if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+		// Windows/Linux：系统 DNS=127.0.0.1，本机 :53 dokodemo 进 dns-out。
+		// Darwin 用 Helper :53→53535，dokodemo 仍在 53535。
+		port = 53
+	}
 	inRaw, _ := doc["inbounds"].([]interface{})
-	for _, item := range inRaw {
+	for i, item := range inRaw {
 		in, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if asString(in["tag"]) == tunDNSInboundTag {
-			return
+		if asString(in["tag"]) != tunDNSInboundTag {
+			continue
 		}
-	}
-	port := singtun.TunDNSForwardPort
-	if runtime.GOOS == "windows" {
-		// Windows 系统 DNS 固定 :53；与 DNSServers=127.0.0.1 对齐。
-		port = 53
+		in["listen"] = "127.0.0.1"
+		in["port"] = port
+		inRaw[i] = in
+		doc["inbounds"] = inRaw
+		return
 	}
 	inRaw = append(inRaw, map[string]interface{}{
 		"listen":   "127.0.0.1",

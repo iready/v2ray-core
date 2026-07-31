@@ -1,9 +1,10 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Activity, FileText, Network, Settings2 } from 'lucide-react'
+import { Activity, FileText, Network, Settings2, Stethoscope } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const navItems = [
   { to: '/', label: '状态', icon: Activity, end: true },
+  { to: '/diagnose', label: '排查', icon: Stethoscope, end: false },
   { to: '/tun', label: 'TUN', icon: Network, end: false },
   { to: '/log', label: '日志', icon: FileText, end: false },
   { to: '/settings', label: '连接配置', icon: Settings2, end: false },
