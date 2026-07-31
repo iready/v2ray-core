@@ -6,14 +6,10 @@ package tun
 import (
 	"context"
 
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
-
 	core "github.com/v2fly/v2ray-core/v5"
-	"github.com/v2fly/v2ray-core/v5/app/tun/device"
-	"github.com/v2fly/v2ray-core/v5/app/tun/device/gvisor"
-	"github.com/v2fly/v2ray-core/v5/app/tun/tunsorter"
+	"github.com/v2fly/v2ray-core/v5/app/tun/singtun"
 	"github.com/v2fly/v2ray-core/v5/common"
-	"github.com/v2fly/v2ray-core/v5/common/net/packetaddr"
+	"github.com/v2fly/v2ray-core/v5/features/outbound"
 	"github.com/v2fly/v2ray-core/v5/features/policy"
 	"github.com/v2fly/v2ray-core/v5/features/routing"
 )
@@ -23,13 +19,11 @@ import (
 type TUN struct {
 	ctx           context.Context
 	dispatcher    routing.Dispatcher
+	router        routing.Router
+	outbound      outbound.Manager
 	policyManager policy.Manager
 	config        *Config
-
-	stack          *stack.Stack
-	device         device.Device
-	preopenedFD    int
-	preopenedFDSet bool
+	engine        *singtun.Engine
 }
 
 func (t *TUN) Type() interface{} {
@@ -37,85 +31,51 @@ func (t *TUN) Type() interface{} {
 }
 
 func (t *TUN) Start() error {
-	DeviceConstructor := gvisor.New
-	deviceOptions := device.Options{
-		Name: t.config.Name,
-		MTU:  t.config.Mtu,
+	input := singtun.ConfigInput{
+		Name:             t.config.Name,
+		MTU:              t.config.Mtu,
+		Tag:              t.config.Tag,
+		UserLevel:        t.config.UserLevel,
+		IPs:              t.config.Ips,
+		Routes:           t.config.Routes,
+		SniffingSettings: t.config.SniffingSettings,
 	}
-	if t.preopenedFDSet {
-		deviceOptions.PreopenedFD = t.preopenedFD
-		deviceOptions.PreopenedFDSet = true
-		t.preopenedFD = -1
-		t.preopenedFDSet = false
-	}
-
-	tunDevice, err := DeviceConstructor(deviceOptions)
+	opts, stackName, input, exclude, bypassHosts := singtun.BuildOptions(input)
+	tunAddrs := singtun.TunInterfaceAddrs(opts.Inet4Address, opts.Inet6Address)
+	handler := singtun.NewHandler(t.ctx, t.dispatcher, t.router, t.outbound, t.policyManager, input, exclude, bypassHosts, tunAddrs)
+	engine, err := singtun.StartWithOptions(t.ctx, opts, stackName, handler)
 	if err != nil {
-		return newError("failed to create device").Base(err).AtError()
+		return newError("failed to start sing-tun").Base(err).AtError()
 	}
-	t.device = tunDevice
-
-	if t.config.PacketEncoding != packetaddr.PacketAddrType_None {
-		writer := device.NewLinkWriterToWriter(tunDevice)
-		sorter := tunsorter.NewTunSorter(writer, t.dispatcher, t.config.PacketEncoding, t.ctx)
-		tunDeviceLayered := NewDeviceWithSorter(tunDevice, sorter)
-		tunDevice = tunDeviceLayered
-	}
-
-	stack, err := t.CreateStack(tunDevice)
-	if err != nil {
-		if closer, ok := t.device.(interface{ Close() }); ok {
-			closer.Close()
-		}
-		t.device = nil
-		return newError("failed to create stack").Base(err).AtError()
-	}
-	t.stack = stack
-
+	t.engine = engine
 	return nil
 }
 
 func (t *TUN) Close() error {
-	if t.stack != nil {
-		t.stack.Close()
-		t.stack.Wait()
-		t.stack = nil
-	} else if t.device != nil {
-		if closer, ok := t.device.(interface{ Close() }); ok {
-			closer.Close()
-		}
-	}
-	t.device = nil
-	if t.preopenedFDSet {
-		_ = device.ClosePreopenedFD(t.preopenedFD)
-		t.preopenedFD = -1
-		t.preopenedFDSet = false
+	if t.engine != nil {
+		err := t.engine.Close()
+		t.engine = nil
+		singtun.ResetPlatform()
+		return err
 	}
 	return nil
 }
 
-func (t *TUN) Init(ctx context.Context, config *Config, dispatcher routing.Dispatcher, policyManager policy.Manager) error {
+func (t *TUN) Init(ctx context.Context, config *Config, dispatcher routing.Dispatcher, router routing.Router, outboundManager outbound.Manager, policyManager policy.Manager) error {
 	t.ctx = ctx
 	t.config = config
 	t.dispatcher = dispatcher
+	t.router = router
+	t.outbound = outboundManager
 	t.policyManager = policyManager
-	t.preopenedFD = -1
-	if config.PreopenedFd != nil {
-		if *config.PreopenedFd < 0 {
-			return newError("invalid preopened_fd: ", *config.PreopenedFd).AtError()
-		}
-		t.preopenedFD = int(*config.PreopenedFd)
-		t.preopenedFDSet = true
-	}
-
 	return nil
 }
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		tun := new(TUN)
-		err := core.RequireFeatures(ctx, func(d routing.Dispatcher, p policy.Manager) error {
-			return tun.Init(ctx, config.(*Config), d, p)
+		err := core.RequireFeatures(ctx, func(d routing.Dispatcher, r routing.Router, o outbound.Manager, p policy.Manager) error {
+			return tun.Init(ctx, config.(*Config), d, r, o, p)
 		})
 		return tun, err
 	}))

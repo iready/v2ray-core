@@ -2,9 +2,11 @@ package tlscfg
 
 import (
 	"encoding/base64"
+	"encoding/pem"
 	"strings"
 
 	"github.com/golang/protobuf/proto"
+	"golang.org/x/crypto/pkcs12"
 
 	"github.com/v2fly/v2ray-core/v5/common/platform/filesystem"
 	"github.com/v2fly/v2ray-core/v5/infra/conf/cfgcommon"
@@ -74,16 +76,37 @@ func (c *TLSConfig) Build() (proto.Message, error) {
 }
 
 type TLSCertConfig struct {
-	CertFile string   `json:"certificateFile"`
-	CertStr  []string `json:"certificate"`
-	KeyFile  string   `json:"keyFile"`
-	KeyStr   []string `json:"key"`
-	Usage    string   `json:"usage"`
+	CertFile       string   `json:"certificateFile"`
+	CertStr        []string `json:"certificate"`
+	KeyFile        string   `json:"keyFile"`
+	KeyStr         []string `json:"key"`
+	Usage          string   `json:"usage"`
+	Pkcs12Base64   string   `json:"pkcs12Base64"`
+	Pkcs12Password string   `json:"pkcs12Password"`
 }
 
 // Build implements Buildable.
 func (c *TLSCertConfig) Build() (*tls.Certificate, error) {
 	certificate := new(tls.Certificate)
+
+	if len(c.Pkcs12Base64) > 0 {
+		if len(c.CertFile) > 0 || len(c.CertStr) > 0 || len(c.KeyFile) > 0 || len(c.KeyStr) > 0 {
+			return nil, newError("pkcs12Base64 conflicts with certificate/key fields")
+		}
+		cert, key, err := buildFromPKCS12(c.Pkcs12Base64, c.Pkcs12Password)
+		if err != nil {
+			return nil, err
+		}
+		certificate.Certificate = cert
+		certificate.Key = key
+
+		usage, err := validateP12Usage(c.Usage)
+		if err != nil {
+			return nil, err
+		}
+		certificate.Usage = usage
+		return certificate, nil
+	}
 
 	cert, err := readFileOrString(c.CertFile, c.CertStr)
 	if err != nil {
@@ -123,4 +146,50 @@ func readFileOrString(f string, s []string) ([]byte, error) {
 		return []byte(strings.Join(s, "\n")), nil
 	}
 	return nil, newError("both file and bytes are empty.")
+}
+
+func buildFromPKCS12(pkcs12Base64 string, password string) ([]byte, []byte, error) {
+	pfxData, err := base64.StdEncoding.DecodeString(pkcs12Base64)
+	if err != nil {
+		return nil, nil, newError("failed to decode pkcs12 base64").Base(err)
+	}
+
+	blocks, err := pkcs12.ToPEM(pfxData, password)
+	if err != nil {
+		return nil, nil, newError("failed to decode pkcs12").Base(err)
+	}
+
+	var certPEM []byte
+	var keyPEM []byte
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		encodedBlock := pem.EncodeToMemory(block)
+		if len(encodedBlock) == 0 {
+			continue
+		}
+		blockType := strings.ToUpper(block.Type)
+		switch {
+		case strings.Contains(blockType, "PRIVATE KEY"):
+			if len(keyPEM) == 0 {
+				keyPEM = encodedBlock
+			}
+		case strings.Contains(blockType, "CERTIFICATE"):
+			certPEM = append(certPEM, encodedBlock...)
+		}
+	}
+
+	if len(certPEM) == 0 || len(keyPEM) == 0 {
+		return nil, nil, newError("pkcs12 missing private key or certificate")
+	}
+
+	return certPEM, keyPEM, nil
+}
+
+func validateP12Usage(usage string) (tls.Certificate_Usage, error) {
+	if usage == "" || strings.EqualFold(usage, "encipherment") {
+		return tls.Certificate_ENCIPHERMENT, nil
+	}
+	return tls.Certificate_ENCIPHERMENT, newError("pkcs12 certificate only supports usage=encipherment")
 }

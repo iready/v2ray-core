@@ -163,6 +163,17 @@ func (s *ClassicNameServer) updateIP(domain string, newRec record) {
 	if updated {
 		s.ips[domain] = rec
 	}
+	if updated && newRec.A != nil && ChinaBypassIPHook != nil {
+		var ips []net.IP
+		for _, addr := range newRec.A.IP {
+			if ip := addr.IP(); len(ip) > 0 {
+				ips = append(ips, ip)
+			}
+		}
+		if len(ips) > 0 {
+			ChinaBypassIPHook(ips)
+		}
+	}
 	if newRec.A != nil {
 		s.pub.Publish(domain+"4", nil)
 	}
