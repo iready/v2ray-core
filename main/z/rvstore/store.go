@@ -36,11 +36,12 @@ type Runtime struct {
 
 // AgentFile ~/.rv/agent.json 完整结构。
 type AgentFile struct {
-	Connection Connection `json:"connection"`
-	Tun        TunProfile `json:"tun,omitempty"`
-	LogProfile LogProfile `json:"log_profile,omitempty"`
-	Cache      V2Cache    `json:"cache,omitempty"`
-	Runtime    Runtime    `json:"runtime,omitempty"`
+	Connection Connection  `json:"connection"`
+	Tun        TunProfile  `json:"tun,omitempty"`
+	LogProfile LogProfile  `json:"log_profile,omitempty"`
+	Mitm       MitmProfile `json:"mitm,omitempty"`
+	Cache      V2Cache     `json:"cache,omitempty"`
+	Runtime    Runtime     `json:"runtime,omitempty"`
 }
 
 // Store 读写 ~/.rv/agent.json。
@@ -108,6 +109,7 @@ func (s *Store) loadLocked() (*AgentFile, error) {
 	file.Connection = normalizeConnection(file.Connection)
 	file.Tun = normalizeTunProfile(file.Tun)
 	file.LogProfile = normalizeLogProfile(file.LogProfile)
+	file.Mitm = normalizeMitmProfile(file.Mitm)
 	return &file, nil
 }
 
@@ -221,6 +223,25 @@ func (s *Store) SaveLogProfile(profile LogProfile) error {
 		return err
 	}
 	file.LogProfile = normalizeLogProfile(profile)
+	return s.saveLocked(file)
+}
+
+func (s *Store) LoadMitmProfile() (MitmProfile, error) {
+	file, err := s.Load()
+	if err != nil {
+		return MitmProfile{}, err
+	}
+	return file.Mitm, nil
+}
+
+func (s *Store) SaveMitmProfile(profile MitmProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	file.Mitm = normalizeMitmProfile(profile)
 	return s.saveLocked(file)
 }
 

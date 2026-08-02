@@ -183,6 +183,141 @@ export async function saveLogProfile(profile: LogProfile): Promise<LogProfile> {
   return data
 }
 
+export interface MitmConnectEndpoint {
+  host: string
+  port: string
+  proxy: string
+  interface?: string
+  local?: boolean
+}
+
+export interface MitmStatus {
+  running: boolean
+  addr?: string
+  web_addr?: string
+  upstream?: string
+  ca_cert_path?: string
+  error?: string
+  ssl_insecure?: boolean
+  flow_count?: number
+  port?: string
+  connect?: MitmConnectEndpoint[]
+}
+
+export interface MitmMapRemoteRule {
+  id?: string
+  enabled: boolean
+  from_proto?: string
+  from_host?: string
+  from_port?: string
+  from_path?: string
+  from_query?: string
+  to_proto?: string
+  to_host?: string
+  to_port?: string
+  to_path?: string
+  to_query?: string
+  preserve_host?: boolean
+  note?: string
+}
+
+export interface MitmProfile {
+  use: boolean
+  addr?: string
+  web_addr?: string
+  upstream?: string
+  ssl_insecure?: boolean
+  ignore_hosts?: string[]
+  media_bypass?: boolean
+  map_remote?: MitmMapRemoteRule[]
+  running?: boolean
+  ca_cert_path?: string
+  error?: string
+  port?: string
+  connect?: MitmConnectEndpoint[]
+}
+
+export async function fetchMitmProfile(): Promise<MitmProfile> {
+  const { data } = await api.get<MitmProfile>('/mitm/profile')
+  return data
+}
+
+export async function saveMitmProfile(profile: MitmProfile): Promise<MitmProfile> {
+  const { data } = await api.put<MitmProfile>('/mitm/profile', profile)
+  return data
+}
+
+export async function fetchMitmStatus(): Promise<MitmStatus> {
+  const { data } = await api.get<MitmStatus>('/mitm/status')
+  return data
+}
+
+export async function enableMitm(): Promise<MitmStatus> {
+  const { data } = await api.post<MitmStatus>('/mitm/enable')
+  return data
+}
+
+export async function disableMitm(): Promise<MitmStatus> {
+  const { data } = await api.post<MitmStatus>('/mitm/disable')
+  return data
+}
+
+export function mitmCADownloadURL(): string {
+  // iOS 隔空投送需要 DER .cer；带 PKCS12 头的 PEM 会报「无效的描述文件」
+  return '/api/mitm/ca.pem?format=cer'
+}
+
+export async function exportMitmCABase64(kind: 'cert' | 'bundle' = 'cert'): Promise<string> {
+  const { data } = await api.get<{ content: string }>('/mitm/ca.base64', { params: { kind } })
+  return data.content
+}
+
+export async function importMitmCA(content: string, password = ''): Promise<MitmProfile> {
+  const { data } = await api.post<MitmProfile>('/mitm/ca/import', { content, password })
+  return data
+}
+
+export async function resetMitmCA(): Promise<MitmProfile> {
+  const { data } = await api.post<MitmProfile>('/mitm/ca/reset')
+  return data
+}
+
+export interface MitmFlowSummary {
+  id: string
+  method: string
+  url: string
+  host: string
+  status_code?: number
+  req_size: number
+  resp_size: number
+  duration_ms?: number
+  started_at: string
+  error?: string
+}
+
+export interface MitmFlowDetail extends MitmFlowSummary {
+  req_headers?: Record<string, string[]>
+  resp_headers?: Record<string, string[]>
+  req_body?: string
+  resp_body?: string
+  req_body_truncated?: boolean
+  resp_body_truncated?: boolean
+}
+
+export async function fetchMitmFlows(): Promise<MitmFlowSummary[]> {
+  const { data } = await api.get<{ flows: MitmFlowSummary[] }>('/mitm/flows')
+  return data.flows ?? []
+}
+
+export async function fetchMitmFlow(id: string): Promise<MitmFlowDetail> {
+  const { data } = await api.get<MitmFlowDetail>(`/mitm/flows/${encodeURIComponent(id)}`)
+  return data
+}
+
+export async function clearMitmFlows(): Promise<void> {
+  await api.delete('/mitm/flows')
+}
+
 export interface DiagnoseCheck {
   id: string
   title: string

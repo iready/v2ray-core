@@ -112,7 +112,7 @@ export default function StatusPage() {
           <CardHeader className="pb-2">
             <CardDescription className="flex items-center gap-1.5">
               <Server className="size-3.5" />
-              v2ray 实例
+              核心实例
             </CardDescription>
             <CardTitle className="font-mono text-2xl">
               {status.healthy_count}/{status.server_count}
@@ -127,11 +127,11 @@ export default function StatusPage() {
       <Card>
         <CardHeader>
           <CardTitle>实例健康</CardTitle>
-          <CardDescription>各 v2ray 实例运行状态与配置版本</CardDescription>
+          <CardDescription>各核心实例运行状态与配置版本</CardDescription>
         </CardHeader>
         <CardContent>
           {servers.length === 0 ? (
-            <p className="text-muted-foreground text-sm">暂无运行中的 v2ray 实例</p>
+            <p className="text-muted-foreground text-sm">暂无运行中的核心实例</p>
           ) : (
             <div className="space-y-3">
               {servers.map((inst) => (

@@ -15,6 +15,7 @@ import (
 
 	"github.com/v2fly/v2ray-core/v5/main/z/localadmin"
 	"github.com/v2fly/v2ray-core/v5/main/z/localconfig"
+	"github.com/v2fly/v2ray-core/v5/main/z/mitmctl"
 	pb "github.com/v2fly/v2ray-core/v5/main/z/proto"
 	"github.com/v2fly/v2ray-core/v5/main/z/regService"
 	"github.com/v2fly/v2ray-core/v5/main/z/rocket"
@@ -193,6 +194,11 @@ func main() {
 				log.Printf("本地后台退出: %v", err)
 			}
 		}()
+		if file, err := adminStore.RVStore().Load(); err == nil {
+			if err := mitmctl.Default().Apply(file.Mitm); err != nil {
+				log.Printf("MITM 启动失败: %v", err)
+			}
+		}
 	}
 
 	if agentCfg.IsComplete() {
@@ -602,6 +608,7 @@ func setupSignal(rt *runtime) {
 		sig := <-ch
 		log.Printf("收到 %v，关闭中...", sig)
 		rt.cancel()
+		_ = mitmctl.Default().Stop()
 		rt.mu.Lock()
 		if rt.rs != nil {
 			rt.rs.StopAllServers()
