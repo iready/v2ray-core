@@ -447,25 +447,25 @@ BUILT_WINDOWS=0
 
 if target_enabled darwin; then
   echo "构建 macOS ARM64..."
-  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket "$CLIENT_PKG"
-  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper "$HELPER_PKG"
+  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket "$CLIENT_PKG" || exit 1
+  CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper "$HELPER_PKG" || exit 1
   # launchd plist 已 go:embed 进 rocket，安装 Helper 时写出，无需旁路拷贝 plist。
 
   echo "构建 macOS x86_64..."
-  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-darwin-x86 "$CLIENT_PKG"
-  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper-darwin-x86 "$HELPER_PKG"
+  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-darwin-x86 "$CLIENT_PKG" || exit 1
+  CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/v2ray-helper-darwin-x86 "$HELPER_PKG" || exit 1
 fi
 
 if target_enabled linux; then
   echo "构建 Linux x86_64..."
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-linux "$CLIENT_PKG"
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket-linux "$CLIENT_PKG" || exit 1
   BUILT_LINUX=1
 fi
 
 if target_enabled windows; then
   # -H windowsgui：无控制台黑框
   echo "构建 Windows x86_64..."
-  CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS -H windowsgui" -o build/rocket.exe "$CLIENT_PKG"
+  CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS -H windowsgui" -o build/rocket.exe "$CLIENT_PKG" || exit 1
   BUILT_WINDOWS=1
 fi
 
