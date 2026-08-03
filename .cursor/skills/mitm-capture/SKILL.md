@@ -3,7 +3,7 @@ name: mitm-capture
 description: >-
   Rocket 客户端（v2ray 仓库）HTTPS 抓包 / localadmin「抓包台」产品与实现约定。
   用户提到抓包、MITM、Map Remote、媒体绕行、CA 证书、流量列表、go-mitmproxy、
-  微信图片转不出来、localadmin mitm 时使用。
+  域名证书、host_certs、微信图片转不出来、localadmin mitm 时使用。
 ---
 
 # 抓包台约定（换机必读）
@@ -26,8 +26,9 @@ description: >-
 ## 产品形态
 
 - **显式 HTTP 代理**（默认 `:19080`），不是 TUN 透明抓包。
-- 流量与配置都在 **localadmin 抓包台**；默认不开独立 go-mitmproxy Web。
-- 体验按「工具台」：HOSTS 轨 + STREAM + INSPECT；**不要**加键盘快捷键；**不要**在文案里提第三方软件名（如 Charles）或「v2ray」品牌话术。
+- 主区永远是 **工作台**（HOSTS / STREAM / INSPECT）；Map Remote、域名证书、连接/CA 都走顶栏 **弹框**，不占主区页签。
+- 体验按「工具台」：**不要**加键盘快捷键（Esc 关弹框除外）；**不要**在文案里提第三方软件名或「v2ray」品牌话术。
+- 弹框壳共用 `MitmDialog`；不要再复制一套遮罩/页脚。
 
 ## CA（装设备 / 导入）
 
@@ -49,6 +50,23 @@ description: >-
 - 把打向 A 的请求改打到 B（From/To：proto/host/port/path/query，Preserve Host）。
 - Path 以 `*` 结尾=前缀；空 Path=整个 Host。
 - 规则进 `MitmProfile.map_remote`，保存并 Apply 后生效；命中写 `X-Rocket-Map-From`。
+- UI：顶栏弹框（与域名证书 / 连接·CA 同形态）。
+
+## 域名证书（host_certs）
+
+- 对指定 SNI 使用用户提供的 **叶子证+私钥** 作为 MITM 服务端证；未命中仍走全局 SelfSign CA。
+- 字段：`host`（精确 / `*.x.com` / 配 `example.com` 时子域也命中）、`cert_pem`、`key_pem`、`enabled`。
+- 叶子可用 **RSA/EC**（与根 CA 必须 RSA 不同）；解析 API：`POST /mitm/host-cert/parse`（P12 Base64+密码或 PEM）。
+- UI：顶栏弹框；录入模式「证书|私钥」左右分栏，或 Bundle/P12。
+- **API 读出不回传 `key_pem`**（只给 `has_key`）；保存时空钥按 id/host 合并旧钥，避免前端重存时抹钥。
+- 实现：`NewCaFunc` → `hostCertCA` 包装 `SelfSignCA`，命中则 `GetCert` 直接返回指定证。
+- App 证书锁定时，必须正好是被锁定的那张证；否则仍握手失败。
+
+## 泄漏与启停
+
+- 依赖 `third_party/go-mitmproxy`（replace）：`Shutdown`/`Close` 必须停掉 attacker Serve，并 `CloseIdleConnections`；若开了遗留 `web_addr`，Manager 须 `WebAddon.Close`。
+- FlowStore 定长环形缓冲，禁止 `seq[1:]` 扩容写法。
+- 巡检：`bash main/z/mitmctl/scripts/check-leaks.sh`；`go test ./main/z/mitmctl/ -run Leak`。
 
 ## 媒体绕行
 

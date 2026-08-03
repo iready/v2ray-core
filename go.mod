@@ -141,3 +141,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	nhooyr.io/websocket v1.8.6 // indirect
 )
+
+// 补丁：Shutdown/Close 同时停 attacker，避免反复 Apply 泄漏 Serve goroutine
+replace github.com/lqqyt2423/go-mitmproxy => ./third_party/go-mitmproxy

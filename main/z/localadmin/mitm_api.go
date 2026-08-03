@@ -11,19 +11,20 @@ import (
 
 // MitmProfileResponse 抓包配置 + 运行态。
 type MitmProfileResponse struct {
-	Use         bool                      `json:"use"`
-	Addr        string                    `json:"addr,omitempty"`
-	WebAddr     string                    `json:"web_addr,omitempty"`
-	Upstream    string                    `json:"upstream,omitempty"`
-	SslInsecure bool                      `json:"ssl_insecure,omitempty"`
+	Use         bool                        `json:"use"`
+	Addr        string                      `json:"addr,omitempty"`
+	WebAddr     string                      `json:"web_addr,omitempty"`
+	Upstream    string                      `json:"upstream,omitempty"`
+	SslInsecure bool                        `json:"ssl_insecure,omitempty"`
 	IgnoreHosts []string                    `json:"ignore_hosts,omitempty"`
 	MediaBypass bool                        `json:"media_bypass,omitempty"`
 	MapRemote   []rvstore.MitmMapRemoteRule `json:"map_remote,omitempty"`
+	HostCerts   []rvstore.MitmHostCertRule  `json:"host_certs,omitempty"`
 	Running     bool                        `json:"running"`
-	CACertPath  string                    `json:"ca_cert_path,omitempty"`
-	Error       string                    `json:"error,omitempty"`
-	Port        string                    `json:"port,omitempty"`
-	Connect     []mitmctl.ConnectEndpoint `json:"connect,omitempty"`
+	CACertPath  string                      `json:"ca_cert_path,omitempty"`
+	Error       string                      `json:"error,omitempty"`
+	Port        string                      `json:"port,omitempty"`
+	Connect     []mitmctl.ConnectEndpoint   `json:"connect,omitempty"`
 }
 
 func mitmProfileResponse(profile rvstore.MitmProfile, st mitmctl.Status) MitmProfileResponse {
@@ -37,12 +38,70 @@ func mitmProfileResponse(profile rvstore.MitmProfile, st mitmctl.Status) MitmPro
 		IgnoreHosts: profile.IgnoreHosts,
 		MediaBypass: profile.MediaBypass,
 		MapRemote:   profile.MapRemote,
+		HostCerts:   redactHostCertKeys(profile.HostCerts),
 		Running:     st.Running,
 		CACertPath:  st.CACertPath,
 		Error:       st.Error,
 		Port:        mitmctl.ListenPort(addr),
 		Connect:     mitmctl.ListConnectEndpoints(addr),
 	}
+}
+
+// redactHostCertKeys：HTTP 响应不回传私钥；仅标记 has_key。
+func redactHostCertKeys(in []rvstore.MitmHostCertRule) []rvstore.MitmHostCertRule {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]rvstore.MitmHostCertRule, len(in))
+	for i, r := range in {
+		out[i] = r
+		if strings.TrimSpace(r.KeyPEM) != "" {
+			out[i].HasKey = true
+		}
+		out[i].KeyPEM = ""
+	}
+	return out
+}
+
+// mergeHostCertKeys：客户端保存时若 key_pem 为空，保留磁盘上同 id/host 的旧钥。
+func mergeHostCertKeys(incoming, existing []rvstore.MitmHostCertRule) []rvstore.MitmHostCertRule {
+	if len(incoming) == 0 {
+		return incoming
+	}
+	byID := make(map[string]rvstore.MitmHostCertRule, len(existing))
+	byHost := make(map[string]rvstore.MitmHostCertRule, len(existing))
+	for _, e := range existing {
+		if e.ID != "" {
+			byID[e.ID] = e
+		}
+		h := strings.ToLower(strings.TrimSpace(e.Host))
+		if h != "" {
+			byHost[h] = e
+		}
+	}
+	out := make([]rvstore.MitmHostCertRule, len(incoming))
+	copy(out, incoming)
+	for i := range out {
+		out[i].HasKey = false // 不落盘
+		if strings.TrimSpace(out[i].KeyPEM) != "" {
+			continue
+		}
+		var old rvstore.MitmHostCertRule
+		var ok bool
+		if out[i].ID != "" {
+			old, ok = byID[out[i].ID]
+		}
+		if !ok {
+			old, ok = byHost[strings.ToLower(strings.TrimSpace(out[i].Host))]
+		}
+		if ok {
+			out[i].KeyPEM = old.KeyPEM
+			if strings.TrimSpace(out[i].CertPEM) == "" {
+				out[i].CertPEM = old.CertPEM
+			}
+		}
+	}
+	return out
 }
 
 func (h *Handler) GetMitmStatus(c *gin.Context) {
@@ -75,6 +134,9 @@ func (h *Handler) PutMitmProfile(c *gin.Context) {
 	if err := c.ShouldBindJSON(&incoming); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if existing, err := h.store.LoadMitmProfile(); err == nil {
+		incoming.HostCerts = mergeHostCertKeys(incoming.HostCerts, existing.HostCerts)
 	}
 	if err := h.persistMitmProfile(incoming); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -170,6 +232,25 @@ func (h *Handler) PostMitmCAReset(c *gin.Context) {
 	}
 	profile, _ := h.store.LoadMitmProfile()
 	c.JSON(http.StatusOK, mitmProfileResponse(profile, mitmctl.Default().Status()))
+}
+
+type mitmHostCertParseReq struct {
+	Content  string `json:"content"`
+	Password string `json:"password"`
+}
+
+func (h *Handler) PostMitmHostCertParse(c *gin.Context) {
+	var req mitmHostCertParseReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	certPEM, keyPEM, err := mitmctl.ParseHostCertMaterial(req.Content, req.Password)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"cert_pem": certPEM, "key_pem": keyPEM})
 }
 
 func (h *Handler) GetMitmFlows(c *gin.Context) {

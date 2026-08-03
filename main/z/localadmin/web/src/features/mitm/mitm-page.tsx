@@ -15,18 +15,20 @@ import {
   fetchMitmProfile,
   importMitmCA,
   mitmCADownloadURL,
+  parseMitmHostCert,
   resetMitmCA,
   saveMitmProfile,
   type MitmConnectEndpoint,
   type MitmFlowDetail,
   type MitmFlowSummary,
+  type MitmHostCertRule,
   type MitmMapRemoteRule,
   type MitmProfile,
 } from '@/api/client'
 
-type Tab = 'flows' | 'map' | 'settings'
 type DetailPane = 'resp' | 'req' | 'headers'
 type NoiseMode = 'all' | 'api' | 'errors'
+type ToolDialog = 'map' | 'hostcert' | 'settings' | null
 
 const VISITED_KEY = 'rocket-mitm-visited-hosts'
 const PINNED_KEY = 'rocket-mitm-pinned-hosts'
@@ -42,7 +44,6 @@ const STATIC_RE =
   /\.(js|css|map|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|m3u8|mp3)(\?|$)/i
 
 export default function MitmPage() {
-  const [tab, setTab] = useState<Tab>('flows')
   const [profile, setProfile] = useState<MitmProfile | null>(null)
   const [addr, setAddr] = useState(':19080')
   const [upstream, setUpstream] = useState('')
@@ -67,6 +68,8 @@ export default function MitmPage() {
   const [caImportPassword, setCaImportPassword] = useState('')
   const [caBusy, setCaBusy] = useState(false)
   const [mapRules, setMapRules] = useState<MitmMapRemoteRule[]>([])
+  const [hostCerts, setHostCerts] = useState<MitmHostCertRule[]>([])
+  const [tool, setTool] = useState<ToolDialog>(null)
 
   const hostCounts = useMemo(() => {
     const m = new Map<string, number>()
@@ -121,6 +124,7 @@ export default function MitmPage() {
     setMediaBypass(!!p.media_bypass)
     setSslInsecure(!!p.ssl_insecure)
     setMapRules(Array.isArray(p.map_remote) ? p.map_remote : [])
+    setHostCerts(Array.isArray(p.host_certs) ? p.host_certs : [])
   }
 
   const loadProfile = useCallback(async () => {
@@ -147,12 +151,11 @@ export default function MitmPage() {
   }, [loadProfile])
 
   useEffect(() => {
-    if (tab !== 'flows') return
     void loadFlows()
     if (!live) return
     const t = window.setInterval(() => void loadFlows(), 1000)
     return () => window.clearInterval(t)
-  }, [tab, live, loadFlows])
+  }, [live, loadFlows])
 
   useEffect(() => {
     if (!selectedID) {
@@ -194,6 +197,7 @@ export default function MitmPage() {
       .filter(Boolean),
     media_bypass: mediaBypass,
     map_remote: mapRules,
+    host_certs: hostCerts,
   })
 
   const rememberHost = (host: string) => {
@@ -375,20 +379,19 @@ export default function MitmPage() {
           {profile.error ? <span className="text-destructive max-w-md truncate text-xs">{profile.error}</span> : null}
         </div>
         <div className="flex gap-1 rounded-lg border p-0.5">
-          <TabBtn active={tab === 'flows'} onClick={() => setTab('flows')}>
-            工作台
-          </TabBtn>
-          <TabBtn active={tab === 'map'} onClick={() => setTab('map')}>
+          <ToolBtn active={tool === 'map'} count={mapRules.filter((r) => r.enabled).length} onClick={() => setTool('map')}>
             Map Remote
-            {mapRules.filter((r) => r.enabled).length > 0 ? (
-              <span className="text-muted-foreground ml-1 font-mono text-[10px]">
-                {mapRules.filter((r) => r.enabled).length}
-              </span>
-            ) : null}
-          </TabBtn>
-          <TabBtn active={tab === 'settings'} onClick={() => setTab('settings')}>
+          </ToolBtn>
+          <ToolBtn
+            active={tool === 'hostcert'}
+            count={hostCerts.filter((r) => r.enabled).length}
+            onClick={() => setTool('hostcert')}
+          >
+            域名证书
+          </ToolBtn>
+          <ToolBtn active={tool === 'settings'} onClick={() => setTool('settings')}>
             连接 / CA
-          </TabBtn>
+          </ToolBtn>
         </div>
       </div>
 
@@ -414,8 +417,7 @@ export default function MitmPage() {
         <span className="text-muted-foreground ml-auto hidden sm:inline">点地址可复制</span>
       </div>
 
-      {tab === 'flows' ? (
-        <div className="flex min-h-0 flex-col gap-2" style={{ height: 'calc(100svh - 9.5rem)' }}>
+      <div className="flex min-h-0 flex-col gap-2" style={{ height: 'calc(100svh - 9.5rem)' }}>
           <div className="flex flex-wrap items-center gap-1.5">
             <Button onClick={() => void handleToggle()} disabled={toggling} size="sm">
               {running || profile.use ? '停' : '开'}
@@ -616,54 +618,143 @@ export default function MitmPage() {
               </div>
             </div>
           </div>
-        </div>
-      ) : tab === 'map' ? (
-        <MapRemotePanel
+      </div>
+
+      {tool === 'map' ? (
+        <MapRemoteDialog
+          onClose={() => setTool(null)}
           rules={mapRules}
           setRules={setMapRules}
           saving={saving}
           onSave={() => void handleSave()}
           seedHost={hostFilter || detail?.host || ''}
         />
-      ) : (
-        <SettingsPanel
-          profile={profile}
-          addr={addr}
-          setAddr={setAddr}
-          upstream={upstream}
-          setUpstream={setUpstream}
-          ignoreHosts={ignoreHosts}
-          setIgnoreHosts={setIgnoreHosts}
-          mediaBypass={mediaBypass}
-          onToggleMediaBypass={() => void toggleMediaBypass()}
-          sslInsecure={sslInsecure}
-          setSslInsecure={setSslInsecure}
-          setProfile={setProfile}
+      ) : null}
+
+      {tool === 'hostcert' ? (
+        <HostCertDialog
+          onClose={() => setTool(null)}
+          rules={hostCerts}
+          setRules={setHostCerts}
           saving={saving}
-          caBusy={caBusy}
-          caBase64={caBase64}
-          caImportText={caImportText}
-          setCaImportText={setCaImportText}
-          caImportPassword={caImportPassword}
-          setCaImportPassword={setCaImportPassword}
           onSave={() => void handleSave()}
-          onExportCA={(k) => void handleExportCA(k)}
-          onImportCA={() => void handleImportCA()}
-          onResetCA={() => void handleResetCA()}
-          onCopy={(t, m) => void copyText(t, m)}
+          seedHost={hostFilter || detail?.host || ''}
         />
-      )}
+      ) : null}
+
+      {tool === 'settings' ? (
+        <MitmDialog
+          title="连接 / CA"
+          description="手机 HTTP 代理；iOS 用 DER .cer + 证书信任设置。"
+          onClose={() => setTool(null)}
+          footer={
+            <>
+              <Button size="sm" variant="outline" onClick={() => setTool(null)}>
+                关闭
+              </Button>
+              <Button size="sm" disabled={saving} onClick={() => void handleSave()}>
+                {saving ? '保存中…' : '保存并应用'}
+              </Button>
+            </>
+          }
+        >
+          <SettingsPanel
+            profile={profile}
+            addr={addr}
+            setAddr={setAddr}
+            upstream={upstream}
+            setUpstream={setUpstream}
+            ignoreHosts={ignoreHosts}
+            setIgnoreHosts={setIgnoreHosts}
+            mediaBypass={mediaBypass}
+            onToggleMediaBypass={() => void toggleMediaBypass()}
+            sslInsecure={sslInsecure}
+            setSslInsecure={setSslInsecure}
+            setProfile={setProfile}
+            caBusy={caBusy}
+            caBase64={caBase64}
+            caImportText={caImportText}
+            setCaImportText={setCaImportText}
+            caImportPassword={caImportPassword}
+            setCaImportPassword={setCaImportPassword}
+            onExportCA={(k) => void handleExportCA(k)}
+            onImportCA={() => void handleImportCA()}
+            onResetCA={() => void handleResetCA()}
+            onCopy={(t, m) => void copyText(t, m)}
+          />
+        </MitmDialog>
+      ) : null}
     </div>
   )
 }
 
-function MapRemotePanel({
+function MitmDialog({
+  title,
+  description,
+  onClose,
+  children,
+  footer,
+}: {
+  title: string
+  description?: React.ReactNode
+  onClose: () => void
+  children: React.ReactNode
+  footer?: React.ReactNode
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
+      <button type="button" className="absolute inset-0 bg-black/50" aria-label="关闭" onClick={onClose} />
+      <div className="bg-background border-border relative z-10 flex max-h-[min(90svh,42rem)] w-full max-w-3xl flex-col overflow-hidden rounded-lg border shadow-lg">
+        <div className="flex items-start justify-between gap-3 border-b px-4 py-3">
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium">{title}</h2>
+            {description ? (
+              <p className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{description}</p>
+            ) : null}
+          </div>
+          <Button size="sm" variant="outline" onClick={onClose}>
+            关闭
+          </Button>
+        </div>
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3">{children}</div>
+        {footer ? (
+          <div className="flex flex-wrap items-center justify-end gap-2 border-t px-4 py-3">{footer}</div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
+function dialogSaveFooter(onClose: () => void, saving: boolean, onSave: () => void) {
+  return (
+    <>
+      <Button size="sm" variant="outline" onClick={onClose}>
+        取消
+      </Button>
+      <Button size="sm" disabled={saving} onClick={onSave}>
+        {saving ? '保存中…' : '保存并应用'}
+      </Button>
+    </>
+  )
+}
+
+function MapRemoteDialog({
+  onClose,
   rules,
   setRules,
   saving,
   onSave,
   seedHost,
 }: {
+  onClose: () => void
   rules: MitmMapRemoteRule[]
   setRules: (r: MitmMapRemoteRule[]) => void
   saving: boolean
@@ -694,16 +785,18 @@ function MapRemotePanel({
   }
 
   return (
-    <div className="space-y-4">
-      <div>
-        <h2 className="text-sm font-medium">Map Remote</h2>
-        <p className="text-muted-foreground mt-1 text-xs leading-relaxed">
-          把原本打向 A 的请求改打到 B。Path 以 <code>*</code> 结尾匹配子路径；留空 Path 表示整个 Host。
-          保存后会重启抓包引擎生效。请求头会带 <code>X-Rocket-Map-From</code>。
-        </p>
-      </div>
-
-      <div className="border-border grid gap-3 rounded-lg border p-3 lg:grid-cols-2">
+    <MitmDialog
+      title="Map Remote"
+      description={
+        <>
+          把打向 A 的请求改打到 B。Path 以 <code>*</code> 结尾匹配子路径；空 Path=整个 Host。命中带{' '}
+          <code>X-Rocket-Map-From</code>。
+        </>
+      }
+      onClose={onClose}
+      footer={dialogSaveFooter(onClose, saving, onSave)}
+    >
+      <div className="grid gap-3 lg:grid-cols-2">
         <fieldset className="space-y-2">
           <legend className="text-muted-foreground mb-1 font-mono text-[11px] tracking-wider uppercase">Map From</legend>
           <MapFields
@@ -744,24 +837,19 @@ function MapRemotePanel({
             }
           />
         </fieldset>
-        <label className="flex items-center gap-2 text-xs lg:col-span-2">
-          <input
-            type="checkbox"
-            checked={!!draft.preserve_host}
-            onChange={(e) => setDraft((d) => ({ ...d, preserve_host: e.target.checked }))}
-            className="size-3.5"
-          />
-          Preserve Host header（保留原 Host 头）
-        </label>
-        <div className="flex flex-wrap gap-2 lg:col-span-2">
-          <Button size="sm" onClick={add}>
-            加入规则
-          </Button>
-          <Button size="sm" variant="outline" disabled={saving} onClick={onSave}>
-            {saving ? '保存中…' : '保存并应用'}
-          </Button>
-        </div>
       </div>
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          checked={!!draft.preserve_host}
+          onChange={(e) => setDraft((d) => ({ ...d, preserve_host: e.target.checked }))}
+          className="size-3.5"
+        />
+        Preserve Host header（保留原 Host 头）
+      </label>
+      <Button size="sm" onClick={add}>
+        加入规则
+      </Button>
 
       <div className="border-border overflow-hidden rounded-lg border">
         <div className="bg-muted/40 text-muted-foreground border-b px-2 py-1 font-mono text-[11px]">
@@ -800,12 +888,221 @@ function MapRemotePanel({
           </ul>
         )}
       </div>
-      {rules.length > 0 ? (
-        <Button size="sm" disabled={saving} onClick={onSave}>
-          {saving ? '保存中…' : '保存并应用'}
-        </Button>
-      ) : null}
-    </div>
+    </MitmDialog>
+  )
+}
+
+function HostCertDialog({
+  onClose,
+  rules,
+  setRules,
+  saving,
+  onSave,
+  seedHost,
+}: {
+  onClose: () => void
+  rules: MitmHostCertRule[]
+  setRules: (r: MitmHostCertRule[]) => void
+  saving: boolean
+  onSave: () => void
+  seedHost: string
+}) {
+  const [host, setHost] = useState(seedHost)
+  const [note, setNote] = useState('')
+  const [mode, setMode] = useState<'bundle' | 'split'>('split')
+  const [material, setMaterial] = useState('')
+  const [password, setPassword] = useState('')
+  const [certText, setCertText] = useState('')
+  const [keyText, setKeyText] = useState('')
+  const [parsing, setParsing] = useState(false)
+
+  const update = (id: string | undefined, patch: Partial<MitmHostCertRule>) => {
+    setRules(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)))
+  }
+
+  const remove = (id: string | undefined) => {
+    setRules(rules.filter((r) => r.id !== id))
+  }
+
+  const resetDraft = () => {
+    setMaterial('')
+    setPassword('')
+    setCertText('')
+    setKeyText('')
+    setNote('')
+    setHost(seedHost)
+  }
+
+  const add = async () => {
+    const h = host.trim()
+    if (!h) {
+      toast.error('域名必填')
+      return
+    }
+    if (mode === 'split') {
+      if (!certText.trim() || !keyText.trim()) {
+        toast.error('请分别粘贴证书与私钥')
+        return
+      }
+    } else if (!material.trim()) {
+      toast.error('请粘贴证书材料（P12 Base64 或 PEM Bundle）')
+      return
+    }
+    setParsing(true)
+    try {
+      let cert_pem: string
+      let key_pem: string
+      if (mode === 'split') {
+        ;({ cert_pem, key_pem } = await parseMitmHostCert(`${certText.trim()}\n${keyText.trim()}`, ''))
+      } else {
+        ;({ cert_pem, key_pem } = await parseMitmHostCert(material, password))
+      }
+      setRules([
+        {
+          id: `hc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+          enabled: true,
+          host: h,
+          cert_pem,
+          key_pem,
+          note: note.trim() || undefined,
+        },
+        ...rules,
+      ])
+      resetDraft()
+      toast.success('已加入规则')
+    } catch (e) {
+      toast.error(apiErrorMessage(e, '解析证书失败'))
+    } finally {
+      setParsing(false)
+    }
+  }
+
+  return (
+    <MitmDialog
+      title="域名证书"
+      description={
+        <>
+          指定 SNI 用你的证+钥；未命中走全局 CA。<code>*.example.com</code> / 配
+          <code>example.com</code> 含子域。锁定场景须正好是被锁的那张。
+        </>
+      }
+      onClose={onClose}
+      footer={dialogSaveFooter(onClose, saving, onSave)}
+    >
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="space-y-1">
+          <Label htmlFor="hc-host">域名</Label>
+          <Input
+            id="hc-host"
+            value={host}
+            onChange={(e) => setHost(e.target.value)}
+            placeholder="api.example.com 或 *.example.com"
+            className="h-8 font-mono text-xs"
+          />
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor="hc-note">备注（可选）</Label>
+          <Input id="hc-note" value={note} onChange={(e) => setNote(e.target.value)} className="h-8 text-xs" />
+        </div>
+      </div>
+
+      <div className="flex w-fit gap-1 rounded-md border p-0.5">
+        <Chip active={mode === 'split'} onClick={() => setMode('split')}>
+          证书 | 私钥
+        </Chip>
+        <Chip active={mode === 'bundle'} onClick={() => setMode('bundle')}>
+          Bundle / P12
+        </Chip>
+      </div>
+
+      {mode === 'split' ? (
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label htmlFor="hc-cert">证书 PEM</Label>
+            <textarea
+              id="hc-cert"
+              value={certText}
+              onChange={(e) => setCertText(e.target.value)}
+              rows={8}
+              className="border-border bg-background w-full rounded-md border px-2 py-1.5 font-mono text-xs outline-none"
+              placeholder={'-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----'}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="hc-key">私钥 PEM</Label>
+            <textarea
+              id="hc-key"
+              value={keyText}
+              onChange={(e) => setKeyText(e.target.value)}
+              rows={8}
+              className="border-border bg-background w-full rounded-md border px-2 py-1.5 font-mono text-xs outline-none"
+              placeholder={'-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----'}
+            />
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="space-y-1">
+            <Label htmlFor="hc-mat">P12 Base64 / PEM Bundle</Label>
+            <textarea
+              id="hc-mat"
+              value={material}
+              onChange={(e) => setMaterial(e.target.value)}
+              rows={5}
+              className="border-border bg-background w-full rounded-md border px-2 py-1.5 font-mono text-xs outline-none"
+              placeholder="粘贴含私钥的 PEM，或 P12 Base64"
+            />
+          </div>
+          <div className="space-y-1 sm:max-w-xs">
+            <Label htmlFor="hc-pwd">P12 密码</Label>
+            <Input
+              id="hc-pwd"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="h-8 font-mono text-xs"
+            />
+          </div>
+        </>
+      )}
+
+      <Button size="sm" disabled={parsing} onClick={() => void add()}>
+        {parsing ? '解析中…' : '加入规则'}
+      </Button>
+
+      <div className="border-border overflow-hidden rounded-lg border">
+        <div className="bg-muted/40 text-muted-foreground border-b px-2 py-1 font-mono text-[11px]">
+          RULES · {rules.length}
+        </div>
+        {rules.length === 0 ? (
+          <p className="text-muted-foreground p-3 text-xs">暂无规则</p>
+        ) : (
+          <ul className="divide-border divide-y">
+            {rules.map((r) => (
+              <li key={r.id || r.host} className="flex flex-wrap items-start gap-2 px-2 py-2 text-xs">
+                <label className="mt-0.5 flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={r.enabled}
+                    onChange={(e) => update(r.id, { enabled: e.target.checked })}
+                    className="size-3.5"
+                  />
+                </label>
+                <div className="min-w-0 flex-1 font-mono">
+                  <div className="truncate">{r.host}</div>
+                      <div className="text-muted-foreground truncate">
+                        {r.note || (r.has_key || r.key_pem ? 'cert+key' : '缺私钥')}
+                      </div>
+                </div>
+                <Button size="sm" variant="outline" onClick={() => remove(r.id)}>
+                  删
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </MitmDialog>
   )
 }
 
@@ -888,14 +1185,12 @@ function SettingsPanel(props: {
   sslInsecure: boolean
   setSslInsecure: (v: boolean) => void
   setProfile: (p: MitmProfile) => void
-  saving: boolean
   caBusy: boolean
   caBase64: string
   caImportText: string
   setCaImportText: (v: string) => void
   caImportPassword: string
   setCaImportPassword: (v: string) => void
-  onSave: () => void
   onExportCA: (k: 'cert' | 'bundle') => void
   onImportCA: () => void
   onResetCA: () => void
@@ -914,14 +1209,12 @@ function SettingsPanel(props: {
     sslInsecure,
     setSslInsecure,
     setProfile,
-    saving,
     caBusy,
     caBase64,
     caImportText,
     setCaImportText,
     caImportPassword,
     setCaImportPassword,
-    onSave,
     onExportCA,
     onImportCA,
     onResetCA,
@@ -932,7 +1225,6 @@ function SettingsPanel(props: {
     <div className="space-y-5">
       <section className="space-y-2">
         <h2 className="text-sm font-medium">可连接地址</h2>
-        <p className="text-muted-foreground text-xs">手机 HTTP 代理；iOS 用 DER .cer + 证书信任设置。</p>
         <ul className="space-y-1.5">
           {(profile.connect || []).map((c: MitmConnectEndpoint) => (
             <li
@@ -1057,9 +1349,6 @@ function SettingsPanel(props: {
           <span className="text-sm">不校验上游 TLS</span>
         </label>
         <p className="text-muted-foreground font-mono text-xs">{profile.ca_cert_path}</p>
-        <Button onClick={onSave} disabled={saving}>
-          {saving ? '保存中…' : '保存并应用'}
-        </Button>
       </section>
     </div>
   )
@@ -1086,12 +1375,14 @@ function stripMediaHosts(current: string) {
     .join(', ')
 }
 
-function TabBtn({
+function ToolBtn({
   active,
+  count,
   onClick,
   children,
 }: {
-  active: boolean
+  active?: boolean
+  count?: number
   onClick: () => void
   children: React.ReactNode
 }) {
@@ -1100,11 +1391,14 @@ function TabBtn({
       type="button"
       onClick={onClick}
       className={cn(
-        'rounded-md px-3 py-1 text-sm transition-colors',
-        active ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground',
+        'rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
+        active ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
       )}
     >
       {children}
+      {count && count > 0 ? (
+        <span className="text-muted-foreground ml-1 font-mono text-[10px]">{count}</span>
+      ) : null}
     </button>
   )
 }

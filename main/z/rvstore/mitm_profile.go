@@ -21,6 +21,17 @@ type MitmMapRemoteRule struct {
 	Note         string `json:"note,omitempty"`
 }
 
+// MitmHostCertRule 特定域名使用指定证书（含私钥）作为服务端证；未命中仍走全局 CA 现签。
+type MitmHostCertRule struct {
+	ID      string `json:"id,omitempty"`
+	Enabled bool   `json:"enabled"`
+	Host    string `json:"host"`              // 匹配 SNI：精确或后缀（如 example.com 匹配 a.example.com）
+	CertPEM string `json:"cert_pem"`          // CERTIFICATE PEM（可多段链）
+	KeyPEM  string `json:"key_pem,omitempty"` // PRIVATE KEY PEM；API 读出时清空
+	HasKey  bool   `json:"has_key,omitempty"` // 仅响应：磁盘上已有私钥，不落盘
+	Note    string `json:"note,omitempty"`
+}
+
 // MitmProfile 本地 HTTPS 抓包（显式代理 + CA），默认关闭。
 type MitmProfile struct {
 	Use         bool                `json:"use"`
@@ -31,6 +42,7 @@ type MitmProfile struct {
 	IgnoreHosts []string            `json:"ignore_hosts,omitempty"` // 手动不解密 host
 	MediaBypass bool                `json:"media_bypass,omitempty"` // 一键绕行常见媒体 CDN（不解密、隧道直通）
 	MapRemote   []MitmMapRemoteRule `json:"map_remote,omitempty"`
+	HostCerts   []MitmHostCertRule  `json:"host_certs,omitempty"` // 按域名指定服务端证书
 }
 
 // MediaBypassHosts 开启「媒体绕行」时并入不解密列表（后缀匹配）。
@@ -73,6 +85,9 @@ func normalizeMitmProfile(p MitmProfile) MitmProfile {
 	if p.MapRemote == nil {
 		p.MapRemote = []MitmMapRemoteRule{}
 	}
+	if p.HostCerts == nil {
+		p.HostCerts = []MitmHostCertRule{}
+	}
 	return p
 }
 
@@ -92,6 +107,11 @@ func (p MitmProfile) Clone() MitmProfile {
 		out.MapRemote = append([]MitmMapRemoteRule(nil), p.MapRemote...)
 	} else {
 		out.MapRemote = []MitmMapRemoteRule{}
+	}
+	if p.HostCerts != nil {
+		out.HostCerts = append([]MitmHostCertRule(nil), p.HostCerts...)
+	} else {
+		out.HostCerts = []MitmHostCertRule{}
 	}
 	return out
 }

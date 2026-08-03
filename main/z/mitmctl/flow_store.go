@@ -60,7 +60,9 @@ type storedFlow struct {
 type FlowStore struct {
 	mu   sync.RWMutex
 	cap  int
-	seq  []string
+	seq  []string // 定长环形；头尾用 head/len 管理，避免 seq[1:] 反复扩容
+	head int
+	n    int
 	byID map[string]*storedFlow
 }
 
@@ -70,7 +72,7 @@ func NewFlowStore(cap int) *FlowStore {
 	}
 	return &FlowStore{
 		cap:  cap,
-		seq:  make([]string, 0, cap),
+		seq:  make([]string, cap),
 		byID: make(map[string]*storedFlow, cap),
 	}
 }
@@ -78,22 +80,25 @@ func NewFlowStore(cap int) *FlowStore {
 func (s *FlowStore) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.seq)
+	return s.n
 }
 
 func (s *FlowStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.seq = s.seq[:0]
+	s.head = 0
+	s.n = 0
+	clear(s.seq)
 	s.byID = make(map[string]*storedFlow, s.cap)
 }
 
 func (s *FlowStore) List() []FlowSummary {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]FlowSummary, 0, len(s.seq))
-	for i := len(s.seq) - 1; i >= 0; i-- {
-		if f := s.byID[s.seq[i]]; f != nil {
+	out := make([]FlowSummary, 0, s.n)
+	for i := s.n - 1; i >= 0; i-- {
+		id := s.seq[(s.head+i)%s.cap]
+		if f := s.byID[id]; f != nil {
 			out = append(out, f.sum)
 		}
 	}
@@ -124,12 +129,14 @@ func (s *FlowStore) upsert(f *storedFlow) {
 	defer s.mu.Unlock()
 	id := f.sum.ID
 	if _, exists := s.byID[id]; !exists {
-		if len(s.seq) >= s.cap {
-			old := s.seq[0]
-			s.seq = s.seq[1:]
+		if s.n >= s.cap {
+			old := s.seq[s.head]
+			s.head = (s.head + 1) % s.cap
+			s.n--
 			delete(s.byID, old)
 		}
-		s.seq = append(s.seq, id)
+		s.seq[(s.head+s.n)%s.cap] = id
+		s.n++
 	}
 	s.byID[id] = f
 }

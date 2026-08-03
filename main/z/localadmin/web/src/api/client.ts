@@ -221,6 +221,16 @@ export interface MitmMapRemoteRule {
   note?: string
 }
 
+export interface MitmHostCertRule {
+  id?: string
+  enabled: boolean
+  host: string
+  cert_pem: string
+  key_pem?: string
+  has_key?: boolean
+  note?: string
+}
+
 export interface MitmProfile {
   use: boolean
   addr?: string
@@ -230,6 +240,7 @@ export interface MitmProfile {
   ignore_hosts?: string[]
   media_bypass?: boolean
   map_remote?: MitmMapRemoteRule[]
+  host_certs?: MitmHostCertRule[]
   running?: boolean
   ca_cert_path?: string
   error?: string
@@ -279,6 +290,17 @@ export async function importMitmCA(content: string, password = ''): Promise<Mitm
 
 export async function resetMitmCA(): Promise<MitmProfile> {
   const { data } = await api.post<MitmProfile>('/mitm/ca/reset')
+  return data
+}
+
+export async function parseMitmHostCert(
+  content: string,
+  password = '',
+): Promise<{ cert_pem: string; key_pem: string }> {
+  const { data } = await api.post<{ cert_pem: string; key_pem: string }>('/mitm/host-cert/parse', {
+    content,
+    password,
+  })
   return data
 }
 

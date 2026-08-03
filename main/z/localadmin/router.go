@@ -36,6 +36,7 @@ func NewRouter(h *Handler, buildFS embed.FS, indexPage []byte) *gin.Engine {
 	api.GET("/mitm/ca.base64", h.GetMitmCABase64)
 	api.POST("/mitm/ca/import", h.PostMitmCAImport)
 	api.POST("/mitm/ca/reset", h.PostMitmCAReset)
+	api.POST("/mitm/host-cert/parse", h.PostMitmHostCertParse)
 	api.GET("/mitm/flows", h.GetMitmFlows)
 	api.GET("/mitm/flows/:id", h.GetMitmFlow)
 	api.DELETE("/mitm/flows", h.DeleteMitmFlows)

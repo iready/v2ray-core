@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	gocert "github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/proxy"
 	"github.com/lqqyt2423/go-mitmproxy/web"
 	"github.com/v2fly/v2ray-core/v5/main/z/rvstore"
@@ -31,12 +33,13 @@ type Status struct {
 }
 
 type Manager struct {
-	mu      sync.Mutex
-	proxy   *proxy.Proxy
-	profile rvstore.MitmProfile
-	running bool
-	lastErr string
-	flows   *FlowStore
+	mu        sync.Mutex
+	proxy     *proxy.Proxy
+	webCloser io.Closer
+	profile   rvstore.MitmProfile
+	running   bool
+	lastErr   string
+	flows     *FlowStore
 }
 
 var defaultMgr = &Manager{flows: NewFlowStore(defaultFlowCap)}
@@ -108,13 +111,14 @@ func (m *Manager) Apply(profile rvstore.MitmProfile) error {
 		m.mu.Unlock()
 		return nil
 	}
-	p, err := newProxy(profile, flows)
+	p, webCloser, err := newProxy(profile, flows)
 	if err != nil {
 		m.lastErr = err.Error()
 		m.mu.Unlock()
 		return err
 	}
 	m.proxy = p
+	m.webCloser = webCloser
 	m.running = true
 	m.mu.Unlock()
 
@@ -127,11 +131,14 @@ func (m *Manager) Apply(profile rvstore.MitmProfile) error {
 				m.running = false
 				m.lastErr = err.Error()
 				m.proxy = nil
+				m.webCloser = nil
 			}
 			m.mu.Unlock()
 		}
 		errCh <- err
 	}()
+	timer := time.NewTimer(120 * time.Millisecond)
+	defer timer.Stop()
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -139,7 +146,7 @@ func (m *Manager) Apply(profile rvstore.MitmProfile) error {
 		}
 		_ = syncDeviceCAFiles()
 		return nil
-	case <-time.After(120 * time.Millisecond):
+	case <-timer.C:
 		// go-mitmproxy 生成的 .cer 常是 PEM；统一洗成 DER，下载按钮才适合 iOS
 		_ = syncDeviceCAFiles()
 		return nil
@@ -270,10 +277,10 @@ func syncDeviceCAFiles() error {
 	return fmt.Errorf("无可用 CA 文件可同步")
 }
 
-func newProxy(profile rvstore.MitmProfile, flows *FlowStore) (*proxy.Proxy, error) {
+func newProxy(profile rvstore.MitmProfile, flows *FlowStore) (*proxy.Proxy, io.Closer, error) {
 	caDir := CertDir()
 	if err := os.MkdirAll(caDir, 0755); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	opts := &proxy.Options{
 		Addr:              profile.EffectiveAddr(),
@@ -282,9 +289,28 @@ func newProxy(profile rvstore.MitmProfile, flows *FlowStore) (*proxy.Proxy, erro
 		CaRootPath:        caDir,
 		Upstream:          strings.TrimSpace(profile.Upstream),
 	}
+	if len(profile.HostCerts) > 0 {
+		hostCerts := append([]rvstore.MitmHostCertRule(nil), profile.HostCerts...)
+		hasEnabled := false
+		for _, r := range hostCerts {
+			if r.Enabled && strings.TrimSpace(r.Host) != "" && strings.TrimSpace(r.CertPEM) != "" && strings.TrimSpace(r.KeyPEM) != "" {
+				hasEnabled = true
+				break
+			}
+		}
+		if hasEnabled {
+			opts.NewCaFunc = func() (gocert.CA, error) {
+				base, err := gocert.NewSelfSignCA(caDir)
+				if err != nil {
+					return nil, err
+				}
+				return NewHostCertCA(base, hostCerts)
+			}
+		}
+	}
 	p, err := proxy.NewProxy(opts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ignore := profile.EffectiveIgnoreHosts()
 	if len(ignore) > 0 {
@@ -295,24 +321,37 @@ func newProxy(profile rvstore.MitmProfile, flows *FlowStore) (*proxy.Proxy, erro
 	p.AddAddon(&proxy.LogAddon{})
 	p.AddAddon(NewMapRemoteAddon(profile.MapRemote))
 	p.AddAddon(NewRecorderAddon(flows))
+	var webCloser io.Closer
 	// 可选：遗留独立 go-mitmproxy 页；默认空，流量看 localadmin
 	if webAddr := profile.EffectiveWebAddr(); webAddr != "" {
-		p.AddAddon(web.NewWebAddon(webAddr))
+		w := web.NewWebAddon(webAddr)
+		p.AddAddon(w)
+		webCloser = w
 	}
-	return p, nil
+	return p, webCloser, nil
 }
 
 func (m *Manager) stopLocked() error {
 	if m.proxy == nil {
 		m.running = false
+		if m.webCloser != nil {
+			_ = m.webCloser.Close()
+			m.webCloser = nil
+		}
 		return nil
 	}
 	p := m.proxy
+	wc := m.webCloser
 	m.proxy = nil
+	m.webCloser = nil
 	m.running = false
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := p.Shutdown(ctx); err != nil {
+	err := p.Shutdown(ctx)
+	if wc != nil {
+		_ = wc.Close()
+	}
+	if err != nil {
 		_ = p.Close()
 		return err
 	}
