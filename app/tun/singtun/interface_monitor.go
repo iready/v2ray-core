@@ -3,10 +3,12 @@
 package singtun
 
 import (
+	"fmt"
 	"sync"
 
 	stun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
+	"github.com/sagernet/sing/common/x/list"
 )
 
 var (
@@ -88,6 +90,38 @@ func CurrentInterfaceName() string {
 		return ""
 	}
 	return def.Name
+}
+
+// RegisterDefaultInterfaceUpdate 在默认物理网卡变更时回调网卡名（空串表示暂时无默认口）。
+// 须先 EnsureStandaloneMonitor / TUN attach；返回的 unregister 可重复调用。
+func RegisterDefaultInterfaceUpdate(cb func(name string)) (unregister func(), err error) {
+	if cb == nil {
+		return func() {}, nil
+	}
+	imMu.Lock()
+	defer imMu.Unlock()
+	if imIface == nil {
+		return nil, fmt.Errorf("interface monitor not started")
+	}
+	var elem *list.Element[stun.DefaultInterfaceUpdateCallback]
+	elem = imIface.RegisterCallback(func(def *control.Interface, _ int) {
+		name := ""
+		if def != nil {
+			name = def.Name
+		}
+		cb(name)
+	})
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			imMu.Lock()
+			defer imMu.Unlock()
+			if imIface != nil && elem != nil {
+				imIface.UnregisterCallback(elem)
+			}
+			elem = nil
+		})
+	}, nil
 }
 
 func detachInterfaceMonitors() {

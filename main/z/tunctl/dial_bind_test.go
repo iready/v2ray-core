@@ -40,6 +40,33 @@ func TestIsLoopbackAddr(t *testing.T) {
 	}
 }
 
+func TestDialBindCacheFollowsUpdate(t *testing.T) {
+	t.Cleanup(DisableDialBind)
+	DisableDialBind()
+
+	bindIfaceMu.Lock()
+	bindIfaceManual = ""
+	bindIfaceAuto = true
+	bindIfaceSnap = "en0"
+	bindIfaceMu.Unlock()
+
+	EnableDialBind("en0")
+	if got := getDialBindIface(); got != "en0" {
+		t.Fatalf("seed: got %q", got)
+	}
+	onDialBindIfaceUpdate("en1")
+	if got := getDialBindIface(); got != "en1" {
+		t.Fatalf("after update: got %q", got)
+	}
+	if got := CurrentBindInterface(); got != "en1" {
+		t.Fatalf("CurrentBindInterface: got %q", got)
+	}
+	onDialBindIfaceUpdate("")
+	if got := getDialBindIface(); got != "en1" {
+		t.Fatalf("empty update should keep last: got %q", got)
+	}
+}
+
 func TestLanBypassSkipsTunSubnet(t *testing.T) {
 	for _, cidr := range lanBypassNetworks() {
 		if cidr == "172.16.0.0/12" || cidr == "172.19.0.0/16" {

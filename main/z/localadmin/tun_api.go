@@ -62,15 +62,15 @@ func (h *Handler) tunOwnerCandidates() []string {
 }
 
 func (h *Handler) bindInterfaceEffective() string {
+	if iface := tunctl.CurrentBindInterface(); iface != "" {
+		return iface
+	}
 	if h.hooks.GetRS != nil {
 		if rs := h.hooks.GetRS(); rs != nil {
-			st := rs.Status()
-			if st.TunBindInterface != "" {
-				return st.TunBindInterface
-			}
+			return rs.Status().TunBindInterface
 		}
 	}
-	return tunctl.CurrentBindInterface()
+	return ""
 }
 
 func (h *Handler) GetTunProfile(c *gin.Context) {

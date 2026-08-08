@@ -1,16 +1,19 @@
 package tunctl
 
 import (
+	"log"
 	"net"
 	"strings"
 	"sync"
 
+	"github.com/v2fly/v2ray-core/v5/app/tun/singtun"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 )
 
 var (
 	dialBindMu    sync.RWMutex
 	dialBindIface string
+	dialBindUnreg func()
 )
 
 func init() {
@@ -35,13 +38,23 @@ func init() {
 }
 
 func withDialBindIface(fn func(iface string) error) error {
-	dialBindMu.RLock()
-	iface := dialBindIface
-	dialBindMu.RUnlock()
+	iface := getDialBindIface()
 	if iface == "" {
 		return nil
 	}
 	return fn(iface)
+}
+
+func getDialBindIface() string {
+	dialBindMu.RLock()
+	defer dialBindMu.RUnlock()
+	return dialBindIface
+}
+
+func setDialBindIface(iface string) {
+	dialBindMu.Lock()
+	dialBindIface = strings.TrimSpace(iface)
+	dialBindMu.Unlock()
 }
 
 func isLoopbackAddr(address string) bool {
@@ -71,13 +84,50 @@ func isEphemeralListenAddr(address string) bool {
 }
 
 // EnableDialBind 对齐 sing-box route.auto_detect_interface：TUN 活跃时全局绑定出站物理网卡。
+// auto 模式下缓存由默认网卡监视器回调刷新；dial 热路径只读缓存。
 func EnableDialBind(iface string) {
+	stopDialBindWatch()
+	iface = strings.TrimSpace(iface)
+	setDialBindIface(iface)
+	if iface == "" || !BindInterfaceAuto() {
+		return
+	}
+	if err := singtun.EnsureStandaloneMonitor(); err != nil {
+		log.Printf("dial-bind watch: monitor: %v", err)
+		return
+	}
+	unreg, err := singtun.RegisterDefaultInterfaceUpdate(onDialBindIfaceUpdate)
+	if err != nil {
+		log.Printf("dial-bind watch: %v", err)
+		return
+	}
 	dialBindMu.Lock()
-	dialBindIface = strings.TrimSpace(iface)
+	dialBindUnreg = unreg
 	dialBindMu.Unlock()
+}
+
+func onDialBindIfaceUpdate(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		// 短暂无默认口时保留上一跳，避免出站绑卡被清空。
+		return
+	}
+	setDialBindIface(name)
+	syncAutoBindSnap(name)
+}
+
+func stopDialBindWatch() {
+	dialBindMu.Lock()
+	unreg := dialBindUnreg
+	dialBindUnreg = nil
+	dialBindMu.Unlock()
+	if unreg != nil {
+		unreg()
+	}
 }
 
 // DisableDialBind 关闭出站绑网卡（TUN 关闭或降级时调用）。
 func DisableDialBind() {
-	EnableDialBind("")
+	stopDialBindWatch()
+	setDialBindIface("")
 }

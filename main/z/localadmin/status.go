@@ -149,7 +149,10 @@ func BuildStatus(rs *rocket.RS, cfg AgentConfig, rt rvstore.Runtime) StatusSnaps
 	snap.TunOwnerKey = st.TunOwnerKey
 	snap.TunActive = st.TunActive
 	snap.TunDegraded = st.TunDegradedReason
-	snap.TunBindIface = st.TunBindInterface
-	snap.TunBindAuto = st.TunBindAuto
+	snap.TunBindIface = tunctl.CurrentBindInterface()
+	if snap.TunBindIface == "" {
+		snap.TunBindIface = st.TunBindInterface
+	}
+	snap.TunBindAuto = tunctl.BindInterfaceAuto() || st.TunBindAuto
 	return snap
 }
