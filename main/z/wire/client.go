@@ -43,8 +43,9 @@ type Client struct {
 	pumpDone   chan error
 	pumpOnce   sync.Once
 
-	onConfigPush  func(*ConfigPayload)
-	onExecutePush func([]*pb.Execute)
+	onConfigPush       func(*ConfigPayload)
+	onExecutePush      func([]*pb.Execute)
+	onDomainStatusPush func(DomainRouteStatusPush)
 }
 
 // Dial 建立 WebSocket。需随后调用 Start() 再发 RPC。
@@ -162,9 +163,51 @@ func (c *Client) ReportStatus(ctx context.Context, payload map[string]any) error
 	return c.call(ctx, "v2fly.agent.report", payload, &res)
 }
 
-func (c *Client) SetPushHandlers(onConfig func(*ConfigPayload), onExecute func([]*pb.Execute)) {
+// DomainRouteRequestResult 服务端受理回执。
+type DomainRouteRequestResult struct {
+	Ok        bool   `json:"ok"`
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+	Msg       string `json:"msg"`
+}
+
+// DomainRouteStatusPush 审批结果推送。
+type DomainRouteStatusPush struct {
+	RequestID    string   `json:"request_id"`
+	ClientReqID  string   `json:"client_req_id"`
+	Status       string   `json:"status"`
+	RejectReason string   `json:"reject_reason"`
+	Added        int      `json:"added"`
+	Skipped      int      `json:"skipped"`
+	RouteNames   []string `json:"route_names"`
+	Domains      []string `json:"domains"`
+}
+
+func (c *Client) SubmitDomainRouteRequest(ctx context.Context, domains []string, remark, clientReqID string) (*DomainRouteRequestResult, error) {
+	var res DomainRouteRequestResult
+	err := c.call(ctx, "v2fly.agent.domain_route_request", map[string]any{
+		"token":         c.token,
+		"domains":       domains,
+		"remark":        remark,
+		"client_req_id": clientReqID,
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+	if !res.Ok {
+		msg := res.Msg
+		if msg == "" {
+			msg = "domain_route_request failed"
+		}
+		return &res, fmt.Errorf("%s", msg)
+	}
+	return &res, nil
+}
+
+func (c *Client) SetPushHandlers(onConfig func(*ConfigPayload), onExecute func([]*pb.Execute), onDomainStatus func(DomainRouteStatusPush)) {
 	c.onConfigPush = onConfig
 	c.onExecutePush = onExecute
+	c.onDomainStatusPush = onDomainStatus
 }
 
 func (c *Client) StartPingLoop(ctx context.Context, version func() int32) {
@@ -357,6 +400,14 @@ func (c *Client) dispatchPush(data []byte) {
 		}
 		if json.Unmarshal(msg.Params, &body) == nil {
 			c.onExecutePush(executesToProto(body.Executes))
+		}
+	case "v2fly.domain_route_request.status":
+		if c.onDomainStatusPush == nil {
+			return
+		}
+		var body DomainRouteStatusPush
+		if json.Unmarshal(msg.Params, &body) == nil {
+			c.onDomainStatusPush(body)
 		}
 	}
 }

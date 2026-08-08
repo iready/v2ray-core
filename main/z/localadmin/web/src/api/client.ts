@@ -360,7 +360,8 @@ export interface DiagnoseReport {
 }
 
 export async function runDiagnose(): Promise<DiagnoseReport> {
-  const { data } = await api.post<DiagnoseReport>('/diagnose')
+  // 后端单项/整体已有超时；前端再兜一层，避免卡顿时页面一直转圈
+  const { data } = await api.post<DiagnoseReport>('/diagnose', null, { timeout: 20000 })
   return data
 }
 
@@ -387,5 +388,37 @@ export async function uninstallAutostart(): Promise<AutostartStatus> {
 
 export async function relaunchAutostart(): Promise<AutostartStatus> {
   const { data } = await api.post<AutostartStatus>('/autostart/relaunch')
+  return data
+}
+
+export interface DomainRouteRequestItem {
+  client_req_id: string
+  request_id?: string
+  domains: string[]
+  remark?: string
+  status: string
+  reject_reason?: string
+  added?: number
+  skipped?: number
+  route_names?: string[]
+  created_at: string
+  updated_at: string
+  last_error?: string
+}
+
+export async function fetchDomainRouteRequests(): Promise<DomainRouteRequestItem[]> {
+  const { data } = await api.get<{ items: DomainRouteRequestItem[] }>('/domain-route-requests')
+  return data.items ?? []
+}
+
+export async function submitDomainRouteRequest(text: string, remark = ''): Promise<DomainRouteRequestItem> {
+  const { data } = await api.post<DomainRouteRequestItem>('/domain-route-requests', { text, remark })
+  return data
+}
+
+export async function flushDomainRouteRequests(): Promise<{ flushed: number; items: DomainRouteRequestItem[]; error?: string }> {
+  const { data } = await api.post<{ flushed: number; items: DomainRouteRequestItem[]; error?: string }>(
+    '/domain-route-requests/flush',
+  )
   return data
 }

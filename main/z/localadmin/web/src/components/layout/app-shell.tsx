@@ -1,10 +1,11 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
-import { Activity, FileText, Network, ScanSearch, Settings2, Stethoscope } from 'lucide-react'
+import { Activity, FileText, Globe2, Network, ScanSearch, Settings2, Stethoscope } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const navItems = [
   { to: '/', label: '状态', icon: Activity, end: true },
   { to: '/diagnose', label: '排查', icon: Stethoscope, end: false },
+  { to: '/domain-route', label: '域名录入', icon: Globe2, end: false },
   { to: '/tun', label: 'TUN', icon: Network, end: false },
   { to: '/mitm', label: '抓包', icon: ScanSearch, end: false },
   { to: '/log', label: '日志', icon: FileText, end: false },

@@ -39,16 +39,8 @@ func KillStaleProcess(pid int) {
 	}
 	_ = proc.Signal(syscall.SIGTERM)
 	time.Sleep(2 * time.Second)
-	if alive, _ := processAlive(pid); alive {
+	if alive, _ := ProcessAlive(pid); alive {
 		_ = proc.Kill()
 		time.Sleep(500 * time.Millisecond)
 	}
-}
-
-func processAlive(pid int) (bool, error) {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false, err
-	}
-	return proc.Signal(syscall.Signal(0)) == nil, nil
 }

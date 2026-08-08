@@ -66,7 +66,7 @@ export default function DiagnosePage() {
         '',
         'running checks…',
         '  · 管理员权限 / 控制面 / 实例 / TUN',
-        '  · 绑网卡 / DNS / 国内·外网 HTTPS（TUN 下含真拉取与 1.1.1.1 TLS）',
+        '  · 绑网卡 / DNS / 国内·外网 HTTPS（单项限时，卡网也会在约 14s 内返回）',
         '',
       ].join('\n'),
     )
@@ -75,8 +75,12 @@ export default function DiagnosePage() {
       setDiag(report)
       setDiagLog(formatDiagnoseLog(report))
     } catch (e: unknown) {
-      const msg = apiErrorMessage(e, '排查失败')
-      setDiagLog((prev) => `${prev}\n✗ ERROR ${msg}\n`)
+      const msg = apiErrorMessage(e, '排查失败或超时')
+      setDiagLog(
+        (prev) =>
+          `${prev}\n✗ ERROR ${msg}\n` +
+          `提示：网络卡死时排查也可能超时；可先关 TUN 恢复国内，再重试。\n`,
+      )
       toast.error(msg)
     } finally {
       setDiagLoading(false)

@@ -49,6 +49,9 @@ func NewRouter(h *Handler, buildFS embed.FS, indexPage []byte) *gin.Engine {
 	api.POST("/autostart/uninstall", h.PostAutostartUninstall)
 	api.POST("/autostart/relaunch", h.PostAutostartRelaunch)
 	api.POST("/diagnose", h.PostDiagnose)
+	api.GET("/domain-route-requests", h.GetDomainRouteRequests)
+	api.POST("/domain-route-requests", h.PostDomainRouteRequest)
+	api.POST("/domain-route-requests/flush", h.PostDomainRouteRequestFlush)
 
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
 	r.Use(static.Serve("/", static.EmbedFolder(buildFS, WebDistRoot)))

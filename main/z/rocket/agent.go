@@ -14,8 +14,10 @@ import (
 
 // AgentHooks v2fly_wire 推送回调。
 type AgentHooks struct {
-	OnConfig  func(*pb.GetConfigRes)
-	OnExecute func([]*pb.Execute)
+	OnConfig            func(*pb.GetConfigRes)
+	OnExecute           func([]*pb.Execute)
+	OnDomainRouteStatus func(wire.DomainRouteStatusPush)
+	OnWireReady         func()
 }
 
 func (rs *RS) machineName() string {
@@ -106,6 +108,26 @@ func (rs *RS) AppliedTokenVersion() int32 {
 	return rs.TokenVersion
 }
 
+// SubmitDomainRouteRequest 经 Wire 上报域名录入申请。
+func (rs *RS) SubmitDomainRouteRequest(ctx context.Context, domains []string, remark, clientReqID string) (string, error) {
+	if rs.wireClient == nil {
+		return "", fmt.Errorf("wire 未连接")
+	}
+	res, err := rs.wireClient.SubmitDomainRouteRequest(ctx, domains, remark, clientReqID)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", fmt.Errorf("empty response")
+	}
+	return res.RequestID, nil
+}
+
+// WireConnected 当前是否持有 Wire 客户端。
+func (rs *RS) WireConnected() bool {
+	return rs.wireClient != nil
+}
+
 // ReloadConfig 停实例、按新配置重启并更新 token 版本。
 // 第二个返回值表示是否实际执行了重载（false 表示版本未变而跳过）。
 func (rs *RS) ReloadConfig(cfg *pb.GetConfigRes) (bool, error) {
@@ -170,6 +192,9 @@ func (rs *RS) RunAgent(ctx context.Context, hooks AgentHooks) {
 			if hooks.OnConfig != nil && cfg != nil {
 				hooks.OnConfig(cfg)
 			}
+			if hooks.OnWireReady != nil {
+				hooks.OnWireReady()
+			}
 		}
 
 		sessionErr := rs.runWireSession(ctx, hooks)
@@ -200,7 +225,11 @@ func (rs *RS) runWireSession(ctx context.Context, hooks AgentHooks) error {
 			}
 		},
 		hooks.OnExecute,
+		hooks.OnDomainRouteStatus,
 	)
+	if hooks.OnWireReady != nil {
+		hooks.OnWireReady()
+	}
 	client.StartPingLoop(ctx, rs.AppliedTokenVersion)
 	return client.Wait(ctx)
 }
