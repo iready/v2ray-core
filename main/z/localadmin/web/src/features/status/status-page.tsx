@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Activity, Link2, Server } from 'lucide-react'
-import { fetchStatus, type ServerInstanceStatus, type StatusSnapshot } from '@/api/client'
+import { Activity, Link2, RotateCw, Server } from 'lucide-react'
+import { toast } from 'sonner'
+import {
+  apiErrorMessage,
+  fetchStatus,
+  restartAgent,
+  type ServerInstanceStatus,
+  type StatusSnapshot,
+} from '@/api/client'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
 
@@ -49,8 +57,22 @@ function tunEffectValue(status: StatusSnapshot): string | undefined {
   return '否'
 }
 
+async function waitUntilBack(): Promise<boolean> {
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 500))
+    try {
+      await fetchStatus()
+      return true
+    } catch {
+      /* 进程退出期间接口会断 */
+    }
+  }
+  return false
+}
+
 export default function StatusPage() {
   const [status, setStatus] = useState<StatusSnapshot | null>(null)
+  const [restarting, setRestarting] = useState(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -60,11 +82,34 @@ export default function StatusPage() {
     }
   }, [])
 
+  async function handleRestart(): Promise<void> {
+    setRestarting(true)
+    try {
+      await restartAgent()
+    } catch (e: unknown) {
+      const msg = apiErrorMessage(e, '')
+      if (msg && !/network|timeout|ECONN|Failed to fetch|Network Error/i.test(msg)) {
+        toast.error(apiErrorMessage(e, '重启失败'))
+        setRestarting(false)
+        return
+      }
+    }
+    toast.message('正在重启 Rocket…')
+    const ok = await waitUntilBack()
+    if (ok) {
+      window.location.reload()
+      return
+    }
+    toast.error('重启超时，请手动打开后台')
+    setRestarting(false)
+  }
+
   useEffect(() => {
+    if (restarting) return
     void refresh()
     const id = setInterval(() => void refresh(), 5000)
     return () => clearInterval(id)
-  }, [refresh])
+  }, [refresh, restarting])
 
   if (!status) {
     return <p className="text-muted-foreground text-sm">加载中...</p>
@@ -78,11 +123,17 @@ export default function StatusPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">运行状态</h1>
-        <p className="text-muted-foreground mt-1 text-sm">
-          只读快照；开关与安装请到「TUN」「连接配置」「排查」。
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">运行状态</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            一个 Rocket 进程；下面多条是它拉起的核心实例。开关与安装请到「TUN」「连接配置」。
+          </p>
+        </div>
+        <Button onClick={() => void handleRestart()} disabled={restarting}>
+          <RotateCw className={restarting ? 'animate-spin' : ''} />
+          {restarting ? '重启中…' : '重启 Rocket'}
+        </Button>
       </div>
 
       <div className="grid gap-4 sm:grid-cols-3">

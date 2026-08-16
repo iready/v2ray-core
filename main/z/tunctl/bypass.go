@@ -60,6 +60,12 @@ func BuildBypassPlan(profile rvstore.TunProfile, wireURL string, configJSONs ...
 		}
 	}
 	excludes = append(excludes, classified.Prefixes...)
+	ntpClassified := classifyBypassEntries(rvstore.DefaultNTPBypassHosts)
+	for _, p := range ntpClassified.Prefixes {
+		if p.Addr().Is4() && !singtun.IsFakeDNSAddr(p.Addr()) {
+			excludes = append(excludes, p)
+		}
+	}
 	// 国内 DNS 上游始终绕行/排除（不依赖 config 是否已含 services.tun）。
 	cnHost := profile.EffectiveCNResolverHost()
 	hosts = append(hosts, cnHost)

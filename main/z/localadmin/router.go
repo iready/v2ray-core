@@ -21,6 +21,7 @@ func NewRouter(h *Handler, buildFS embed.FS, indexPage []byte) *gin.Engine {
 	api.GET("/config/server", h.GetServerConfig)
 	api.PUT("/config", h.PutConfig)
 	api.POST("/reconnect", h.PostReconnect)
+	api.POST("/restart", h.PostRestart)
 	api.GET("/tun/status", h.GetTunStatus)
 	api.GET("/tun/profile", h.GetTunProfile)
 	api.PUT("/tun/profile", h.PutTunProfile)

@@ -26,6 +26,17 @@ var DefaultFakeDNSDomains = []string{
 	"geosite:geolocation-!cn",
 }
 
+// DefaultNTPBypassHosts 系统校时域名：国内 DNS 用 full+domain 抢在 FakeDNS geosite 之前真解析。
+var DefaultNTPBypassHosts = []string{
+	"time.windows.com",
+	"time.apple.com",
+	"time.google.com",
+	"time.nist.gov",
+	"pool.ntp.org",
+	"ntp.aliyun.com",
+	"ntp.tencent.com",
+}
+
 // DefaultCNResolver 国内 geosite:cn 默认上游（按平台）。
 func DefaultCNResolver() string {
 	if runtime.GOOS == "darwin" {

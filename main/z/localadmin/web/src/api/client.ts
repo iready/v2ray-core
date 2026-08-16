@@ -105,6 +105,10 @@ export async function reconnect(): Promise<void> {
   await api.post('/reconnect')
 }
 
+export async function restartAgent(): Promise<void> {
+  await api.post('/restart')
+}
+
 export interface TunStatus {
   enabled: boolean
   helper_installed: boolean

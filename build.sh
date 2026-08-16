@@ -124,6 +124,36 @@ target_enabled() {
   [[ "$TARGET" == "all" || "$TARGET" == "$1" ]]
 }
 
+is_windows_host() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW* | MSYS* | CYGWIN*) return 0 ;;
+  esac
+  [[ "${OS:-}" == "Windows_NT" ]]
+}
+
+# 本机 Windows 编 rocket.exe 时，正在跑的进程会锁文件导致 go build / upx 失败。
+stop_running_rocket_exe() {
+  echo "结束本机 rocket.exe ..."
+  MSYS_NO_PATHCONV=1 cmd.exe /c "taskkill /F /IM rocket.exe /T" >/dev/null 2>&1 || true
+  sleep 1
+}
+
+# 覆盖本机 GOTOOLCHAIN=local / GOSUMDB=off，按 go.mod 的 toolchain 拉对应 Go。
+ensure_go_toolchain() {
+  local toolchain sumdb
+  toolchain=$(awk '/^toolchain[[:space:]]/{print $2; exit}' "$SCRIPT_DIR/go.mod")
+  if [[ -z "$toolchain" ]]; then
+    return 0
+  fi
+  # 必须先读 GOSUMDB：一旦 export GOTOOLCHAIN，go env 会去拉 toolchain，GOSUMDB=off 会直接失败。
+  sumdb=$(go env GOSUMDB 2>/dev/null || true)
+  export GOTOOLCHAIN="$toolchain"
+  if [[ "$sumdb" == "off" ]]; then
+    export GOSUMDB=sum.golang.google.cn
+  fi
+  echo "Go toolchain: $GOTOOLCHAIN"
+}
+
 parse_args() {
   CLI_TARGET=""
   while [[ $# -gt 0 ]]; do
@@ -445,6 +475,8 @@ HELPER_PKG=github.com/v2fly/v2ray-core/v5/main/z/cmd/v2ray-helper
 BUILT_LINUX=0
 BUILT_WINDOWS=0
 
+ensure_go_toolchain
+
 if target_enabled darwin; then
   echo "构建 macOS ARM64..."
   CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags "$LDFLAGS" -o build/rocket "$CLIENT_PKG" || exit 1
@@ -463,6 +495,9 @@ if target_enabled linux; then
 fi
 
 if target_enabled windows; then
+  if is_windows_host; then
+    stop_running_rocket_exe
+  fi
   # -H windowsgui：无控制台黑框
   echo "构建 Windows x86_64..."
   CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags "$LDFLAGS -H windowsgui" -o build/rocket.exe "$CLIENT_PKG" || exit 1

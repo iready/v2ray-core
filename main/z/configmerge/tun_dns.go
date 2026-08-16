@@ -38,6 +38,7 @@ func ApplyTunOwnerDNSPolicy(raw string, profile rvstore.TunProfile) (string, err
 	ensureTunDNSInbound(doc)
 	ensureTunDNSForwardRule(doc)
 	ensureTunDNSRule(doc, tunTag)
+	ensureTunNTPDirectRule(doc, tunTag)
 	ensureRoutingDomainStrategy(doc)
 	_ = tunIPv4FromDoc(tun)
 	return marshalDoc(doc)
@@ -57,7 +58,7 @@ func ensureTunOwnerDNS(doc map[string]interface{}, profile rvstore.TunProfile) {
 	for _, d := range fakeDomains {
 		fakeDomainList = append(fakeDomainList, d)
 	}
-	// 国内 → cnResolver（真直连）；FakeDNS → fakeDomains；其余境外 → remoteResolver 经代理。
+	// 国内+NTP → cnResolver（真直连）；FakeDNS → fakeDomains；其余境外 → remoteResolver 经代理。
 	remote := map[string]interface{}{
 		"address": remoteResolver,
 		"tag":     tunRemoteDNSTag,
@@ -65,10 +66,14 @@ func ensureTunOwnerDNS(doc map[string]interface{}, profile rvstore.TunProfile) {
 	if proxyTag := preferTUNProxyOutboundTag(doc); proxyTag != "" {
 		ensureDNSRemoteInboundRoute(doc, tunRemoteDNSTag, proxyTag)
 	}
+	cnDomains := []interface{}{"geosite:cn"}
+	for _, h := range rvstore.DefaultNTPBypassHosts {
+		cnDomains = append(cnDomains, "full:"+h, "domain:"+h)
+	}
 	dns["servers"] = []interface{}{
 		map[string]interface{}{
 			"address":      cnResolver,
-			"domains":      []interface{}{"geosite:cn"},
+			"domains":      cnDomains,
 			"skipFallback": true,
 			"tag":          tunCNDNSTag,
 		},
@@ -363,6 +368,49 @@ func hasInboundDNSForwardRule(rules []interface{}) bool {
 					return true
 				}
 			}
+		}
+	}
+	return false
+}
+
+func ensureTunNTPDirectRule(doc map[string]interface{}, tunTag string) {
+	directTag := firstDirectOutboundTag(doc)
+	if directTag == "" {
+		directTag = "direct"
+	}
+	routing, _ := doc["routing"].(map[string]interface{})
+	if routing == nil {
+		routing = map[string]interface{}{}
+		doc["routing"] = routing
+	}
+	rules, _ := routing["rules"].([]interface{})
+	if hasTunNTPDirectRule(rules, tunTag, directTag) {
+		return
+	}
+	rules = append([]interface{}{map[string]interface{}{
+		"type":        "field",
+		"inboundTag":  []interface{}{tunTag},
+		"network":     "udp",
+		"port":        "123",
+		"outboundTag": directTag,
+	}}, rules...)
+	routing["rules"] = rules
+}
+
+func hasTunNTPDirectRule(rules []interface{}, tunTag, directTag string) bool {
+	for _, item := range rules {
+		rule, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if !ruleMatchesInbound(rule, tunTag) {
+			continue
+		}
+		if asString(rule["port"]) != "123" {
+			continue
+		}
+		if asString(rule["outboundTag"]) == directTag {
+			return true
 		}
 	}
 	return false

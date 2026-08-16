@@ -88,8 +88,8 @@ func shouldDropUDP(destination M.Socksaddr) bool {
 		return true
 	}
 	// TUN 全量劫持下 udpnat LRU=1024；非 DNS UDP（QUIC/WebRTC/STUN…）会打满并持续淘汰重建出站套接字。
-	// DNS 走 53；其余 UDP 在建 NAT 前丢弃（浏览主要靠 TCP）。
-	if destination.Port != 53 {
+	// DNS 走 53；NTP 走 123（系统校时，须能到达 BypassHosts / 直连）；其余 UDP 在建 NAT 前丢弃。
+	if destination.Port != 53 && destination.Port != 123 {
 		return true
 	}
 	return false
