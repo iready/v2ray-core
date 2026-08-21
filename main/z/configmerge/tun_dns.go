@@ -51,14 +51,14 @@ func ensureTunOwnerDNS(doc map[string]interface{}, profile rvstore.TunProfile) {
 		doc["dns"] = dns
 	}
 	ensureFakeDNSPool(dns)
-	cnResolver := profile.EffectiveCNResolver()
+	cnResolvers := profile.EffectiveCNResolvers()
 	remoteResolver := profile.EffectiveRemoteResolver()
 	fakeDomains := profile.EffectiveFakeDNSDomains()
 	fakeDomainList := make([]interface{}, 0, len(fakeDomains))
 	for _, d := range fakeDomains {
 		fakeDomainList = append(fakeDomainList, d)
 	}
-	// 国内+NTP → cnResolver（真直连）；FakeDNS → fakeDomains；其余境外 → remoteResolver 经代理。
+	// 国内+NTP → cnResolvers（真直连，顺序即优先级）；FakeDNS → fakeDomains；其余境外 → remoteResolver 经代理。
 	remote := map[string]interface{}{
 		"address": remoteResolver,
 		"tag":     tunRemoteDNSTag,
@@ -70,20 +70,29 @@ func ensureTunOwnerDNS(doc map[string]interface{}, profile rvstore.TunProfile) {
 	for _, h := range rvstore.DefaultNTPBypassHosts {
 		cnDomains = append(cnDomains, "full:"+h, "domain:"+h)
 	}
-	dns["servers"] = []interface{}{
-		map[string]interface{}{
-			"address":      cnResolver,
+	servers := make([]interface{}, 0, len(cnResolvers)+2)
+	for i, addr := range cnResolvers {
+		item := map[string]interface{}{
+			"address":      addr,
 			"domains":      cnDomains,
 			"skipFallback": true,
-			"tag":          tunCNDNSTag,
-		},
+		}
+		if i == 0 {
+			item["tag"] = tunCNDNSTag
+		} else {
+			item["tag"] = fmt.Sprintf("%s-%d", tunCNDNSTag, i)
+		}
+		servers = append(servers, item)
+	}
+	servers = append(servers,
 		map[string]interface{}{
 			"address":      "fakedns",
 			"domains":      fakeDomainList,
 			"skipFallback": true,
 		},
 		remote,
-	}
+	)
+	dns["servers"] = servers
 	if asString(dns["queryStrategy"]) == "" {
 		dns["queryStrategy"] = "UseIPv4"
 	}
@@ -205,76 +214,6 @@ func hasFakeDNSPool(dns map[string]interface{}) bool {
 	default:
 		return false
 	}
-}
-
-func ensureTunDNSServers(dns map[string]interface{}, cnDNS string) {
-	cnResolver := rvstore.ResolveCNResolver(cnDNS)
-	servers, _ := dns["servers"].([]interface{})
-	if !hasCNResolver(servers, cnResolver) {
-		servers = append([]interface{}{map[string]interface{}{
-			"address":      cnResolver,
-			"domains":      []interface{}{"geosite:cn"},
-			"skipFallback": true,
-			"tag":          tunCNDNSTag,
-		}}, servers...)
-	}
-	if !hasFakeDNSServer(servers) {
-		servers = append(servers, "fakedns")
-	}
-	dns["servers"] = servers
-}
-
-func hasCNResolver(servers []interface{}, cnResolver string) bool {
-	for _, item := range servers {
-		switch s := item.(type) {
-		case string:
-			if s == cnResolver {
-				return true
-			}
-		case map[string]interface{}:
-			if asString(s["tag"]) == tunCNDNSTag {
-				return true
-			}
-			if asString(s["address"]) == cnResolver && serverHasDomain(s, "geosite:cn") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func hasFakeDNSServer(servers []interface{}) bool {
-	for _, item := range servers {
-		switch s := item.(type) {
-		case string:
-			if strings.EqualFold(s, "fakedns") {
-				return true
-			}
-		case map[string]interface{}:
-			if strings.EqualFold(asString(s["address"]), "fakedns") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func serverHasDomain(server map[string]interface{}, want string) bool {
-	raw, ok := server["domains"]
-	if !ok {
-		return false
-	}
-	switch domains := raw.(type) {
-	case string:
-		return domains == want
-	case []interface{}:
-		for _, d := range domains {
-			if asString(d) == want {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func ensureDNSOutbound(doc map[string]interface{}) {

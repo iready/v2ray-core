@@ -94,14 +94,16 @@ print_usage() {
   cat <<'EOF'
 用法: ./build.sh [选项]
 
-  --os <target>     目标平台: windows（默认）| darwin | linux | all
-  -r, --reuse-last  沿用上次/默认构建选择，全程无提问
-  -h, --help        显示此帮助
+  --os <target>         目标平台: windows（默认）| darwin | linux | all
+  -r, --reuse-last      沿用上次/默认构建选择，全程无提问
+  --install-startup     Windows：编完后覆盖 Startup\rocket.exe、拉起、等后台就绪
+  -h, --help            显示此帮助
 
 示例:
   ./build.sh -r                 # 仅 Windows，沿用上次选择
   ./build.sh --os windows -r    # 同上
   ./build.sh --os all -r        # 全平台
+  ./build.sh --os windows -r --install-startup
 
 无参数时：若存在 .build.prefs.local 则只问一次是否沿用上次全部选择。
 EOF
@@ -131,11 +133,92 @@ is_windows_host() {
   [[ "${OS:-}" == "Windows_NT" ]]
 }
 
+# Git Bash 里 go/yarn 跑完后 PATH 经常丢 System32，cmd.exe 会变 command not found。
+windows_sys32() {
+  local s
+  s="$(cygpath -S 2>/dev/null || true)"
+  if [[ -n "$s" ]]; then
+    cygpath -u "$s"
+    return
+  fi
+  echo "/c/Windows/System32"
+}
+
+windows_root() {
+  local s
+  s="$(cygpath -W 2>/dev/null || true)"
+  if [[ -n "$s" ]]; then
+    cygpath -u "$s"
+    return
+  fi
+  echo "/c/Windows"
+}
+
+win32() {
+  local exe="$1"
+  shift
+  local bin
+  case "$exe" in
+    explorer.exe) bin="$(windows_root)/explorer.exe" ;;
+    *) bin="$(windows_sys32)/$exe" ;;
+  esac
+  MSYS_NO_PATHCONV=1 "$bin" "$@"
+}
+
+rocket_exe_running() {
+  win32 tasklist.exe /FI "IMAGENAME eq rocket.exe" 2>/dev/null | grep -qi rocket.exe
+}
+
 # 本机 Windows 编 rocket.exe 时，正在跑的进程会锁文件导致 go build / upx 失败。
 stop_running_rocket_exe() {
+  local f="$SCRIPT_DIR/build/rocket.exe"
   echo "结束本机 rocket.exe ..."
-  MSYS_NO_PATHCONV=1 cmd.exe /c "taskkill /F /IM rocket.exe /T" >/dev/null 2>&1 || true
-  sleep 1
+  if rocket_exe_running; then
+    win32 taskkill.exe /F /IM rocket.exe /T >/dev/null 2>&1 || true
+  fi
+  local i
+  for i in $(seq 1 30); do
+    rocket_exe_running || break
+    sleep 1
+  done
+  if rocket_exe_running; then
+    echo "rocket.exe 仍在运行，无法覆盖" >&2
+    exit 1
+  fi
+  [[ -f "$f" ]] || return 0
+  for i in $(seq 1 20); do
+    if mv -f "$f" "$f.unlock" 2>/dev/null; then
+      mv -f "$f.unlock" "$f"
+      return 0
+    fi
+    echo "build/rocket.exe 仍被占用 (${i}s)"
+    sleep 1
+  done
+  echo "build/rocket.exe 仍被占用，无法覆盖" >&2
+  exit 1
+}
+
+install_windows_startup() {
+  local src="$SCRIPT_DIR/build/rocket.exe"
+  local dest="${APPDATA}/Microsoft/Windows/Start Menu/Programs/Startup/rocket.exe"
+  local dest_win
+  [[ -f "$src" ]] || { echo "缺少 $src" >&2; exit 1; }
+  mkdir -p "$(dirname "$dest")"
+  cp -f "$src" "$dest"
+  dest_win="$(cygpath -w "$dest")"
+  echo "已写入 $dest_win"
+  win32 cmd.exe /c start "" "$dest_win"
+  local i
+  for i in $(seq 1 45); do
+    if curl -fsS --max-time 2 http://127.0.0.1:19527/api/status >/dev/null 2>&1; then
+      echo "rocket admin ok (${i}s)"
+      win32 explorer.exe /select,"$dest_win"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "rocket admin 未就绪" >&2
+  exit 1
 }
 
 # 覆盖本机 GOTOOLCHAIN=local / GOSUMDB=off，按 go.mod 的 toolchain 拉对应 Go。
@@ -156,6 +239,7 @@ ensure_go_toolchain() {
 
 parse_args() {
   CLI_TARGET=""
+  INSTALL_STARTUP=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --os)
@@ -170,6 +254,7 @@ parse_args() {
         shift
         ;;
       -r | --reuse-last) REUSE_LAST=1; shift ;;
+      --install-startup) INSTALL_STARTUP=1; shift ;;
       -h | --help) print_usage; exit 0 ;;
       *)
         echo "未知参数: $1"
@@ -544,3 +629,11 @@ fi
 echo "构建完成！目标=$TARGET"
 echo "构建文件："
 ls -la build/
+
+if [[ ${INSTALL_STARTUP:-0} -eq 1 ]]; then
+  if [[ ${BUILT_WINDOWS:-0} -ne 1 ]]; then
+    echo "--install-startup 需要本次编出 Windows（--os windows|all）" >&2
+    exit 1
+  fi
+  install_windows_startup
+fi

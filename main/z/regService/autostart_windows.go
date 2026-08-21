@@ -3,12 +3,16 @@
 package regService
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/windows/registry"
 )
 
 const (
@@ -25,7 +29,9 @@ func execPathAbs() (string, error) {
 }
 
 func schtasks(args ...string) ([]byte, error) {
-	cmd := exec.Command("schtasks", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "schtasks", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	return cmd.CombinedOutput()
 }
@@ -67,9 +73,16 @@ func UninstallAutoStart() error {
 }
 
 // AutoStartInstalled 是否已注册提权自启任务。
+// 读注册表，避免 schtasks RPC 在 TUN/DNS 卡死时把 /api/status 一起拖死。
 func AutoStartInstalled() bool {
-	_, err := schtasks("/Query", "/TN", autoStartTaskName)
-	return err == nil
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
+		`SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\`+autoStartTaskName,
+		registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	_ = k.Close()
+	return true
 }
 
 // RunAutoStart 立即运行已注册的提权任务（供非提权进程自拉起）。

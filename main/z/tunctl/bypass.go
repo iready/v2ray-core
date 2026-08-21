@@ -67,10 +67,11 @@ func BuildBypassPlan(profile rvstore.TunProfile, wireURL string, configJSONs ...
 		}
 	}
 	// 国内 DNS 上游始终绕行/排除（不依赖 config 是否已含 services.tun）。
-	cnHost := profile.EffectiveCNResolverHost()
-	hosts = append(hosts, cnHost)
-	if p, err := netip.ParsePrefix(cnHost + "/32"); err == nil {
-		excludes = append(excludes, p)
+	for _, cnHost := range profile.EffectiveCNResolverHosts() {
+		hosts = append(hosts, cnHost)
+		if p, err := netip.ParsePrefix(cnHost + "/32"); err == nil {
+			excludes = append(excludes, p)
+		}
 	}
 	for _, raw := range configJSONs {
 		if !HasTUNService(raw) {

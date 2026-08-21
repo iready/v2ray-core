@@ -18,8 +18,8 @@ type TunProfileResponse struct {
 	BindInterface           string                 `json:"bind_interface,omitempty"`
 	BindInterfaceCandidates []string               `json:"bind_interface_candidates,omitempty"`
 	BindInterfaceEffective  string                 `json:"bind_interface_effective,omitempty"`
-	CnDNS                   string                 `json:"cn_dns,omitempty"`
-	CnDNSDefault            string                 `json:"cn_dns_default"`
+	CnDNS                   []string               `json:"cn_dns,omitempty"`
+	CnDNSDefault            []string               `json:"cn_dns_default"`
 	RemoteDNS               string                 `json:"remote_dns,omitempty"`
 	RemoteDNSDefault        string                 `json:"remote_dns_default"`
 	FakeDNSDomains          []string               `json:"fakedns_domains,omitempty"`
@@ -40,7 +40,7 @@ func tunProfileResponse(profile rvstore.TunProfile, serverHasTemplate bool, cand
 		BindInterfaceCandidates: tunctl.ListBindInterfaceCandidates(),
 		BindInterfaceEffective:  bindEffective,
 		CnDNS:                   profile.CnDNS,
-		CnDNSDefault:            rvstore.DefaultCNResolver(),
+		CnDNSDefault:            rvstore.DefaultCNResolvers(),
 		RemoteDNS:               profile.RemoteDNS,
 		RemoteDNSDefault:        rvstore.DefaultRemoteResolver,
 		FakeDNSDomains:          profile.FakeDNSDomains,

@@ -8,11 +8,8 @@ import (
 )
 
 const (
-	defaultCNHost = "223.5.5.5"
-	// Darwin：部分网络 TCP/53→阿里 DNS 被重置，用 DoH local。
-	defaultCNResolverDarwin = "https+local://223.5.5.5/dns-query"
-	// Linux/Windows：沿用此前可用的 tcp+local。
-	defaultCNResolverOther = "tcp+local://223.5.5.5:53"
+	defaultCNHost    = "223.5.5.5"
+	defaultCNHostAlt = "223.6.6.6"
 )
 
 // DefaultRemoteResolver 境外 DNS 默认上游（TCP，可经代理出站）。
@@ -37,20 +34,20 @@ var DefaultNTPBypassHosts = []string{
 	"ntp.tencent.com",
 }
 
-// DefaultCNResolver 国内 geosite:cn 默认上游（按平台）。
-func DefaultCNResolver() string {
-	if runtime.GOOS == "darwin" {
-		return defaultCNResolverDarwin
+// DefaultCNResolvers 国内 geosite:cn 默认上游列表（按平台，顺序即优先级）。
+func DefaultCNResolvers() []string {
+	return []string{
+		ResolveCNResolver(defaultCNHost),
+		ResolveCNResolver(defaultCNHostAlt),
 	}
-	return defaultCNResolverOther
 }
 
-// ResolveCNResolver 将用户填写规范化为 v2ray DNS address。
-// 空 → 平台默认；裸 IP/主机 → 按平台补协议；已含 :// → 原样。
+// ResolveCNResolver 将单条用户填写规范化为 v2ray DNS address。
+// 裸 IP/主机 → 按平台补协议；已含 :// → 原样；空 → 空。
 func ResolveCNResolver(raw string) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return DefaultCNResolver()
+		return ""
 	}
 	if strings.Contains(s, "://") {
 		return s
@@ -59,6 +56,27 @@ func ResolveCNResolver(raw string) string {
 		return "https+local://" + s + "/dns-query"
 	}
 	return "tcp+local://" + s + ":53"
+}
+
+// ResolveCNResolvers 规范化国内 DNS 列表；空则用平台默认。
+func ResolveCNResolvers(raws []string) []string {
+	seen := make(map[string]struct{}, len(raws))
+	out := make([]string, 0, len(raws))
+	for _, r := range raws {
+		addr := ResolveCNResolver(r)
+		if addr == "" {
+			continue
+		}
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		out = append(out, addr)
+	}
+	if len(out) == 0 {
+		return DefaultCNResolvers()
+	}
+	return out
 }
 
 // ResolveRemoteResolver 境外 DNS：空 → 默认；裸 IP → tcp://IP:53；已含 :// → 原样。
@@ -91,9 +109,22 @@ func ResolveFakeDNSDomains(domains []string) []string {
 	return out
 }
 
-// CNResolverHost 取出绕行用的主机/IP；解析失败时回退默认上游主机。
-func CNResolverHost(raw string) string {
-	return resolverHost(ResolveCNResolver(raw), defaultCNHost)
+// CNResolverHosts 取出国内 DNS 绕行用的主机/IP（去重，保序）。
+func CNResolverHosts(raws []string) []string {
+	seen := make(map[string]struct{})
+	var hosts []string
+	for _, addr := range ResolveCNResolvers(raws) {
+		h := resolverHost(addr, defaultCNHost)
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		hosts = append(hosts, h)
+	}
+	return hosts
 }
 
 // RemoteResolverHost 境外 DNS 绕行主机（若为 IP；域名则原样返回供 hosts 列表）。
@@ -113,14 +144,14 @@ func resolverHost(addr, fallback string) string {
 	return fallback
 }
 
-// EffectiveCNResolver 本机 TUN 偏好的国内 DNS 地址。
-func (p TunProfile) EffectiveCNResolver() string {
-	return ResolveCNResolver(p.CnDNS)
+// EffectiveCNResolvers 本机 TUN 偏好的国内 DNS 地址列表。
+func (p TunProfile) EffectiveCNResolvers() []string {
+	return ResolveCNResolvers(p.CnDNS)
 }
 
-// EffectiveCNResolverHost 国内 DNS 绕行主机。
-func (p TunProfile) EffectiveCNResolverHost() string {
-	return CNResolverHost(p.CnDNS)
+// EffectiveCNResolverHosts 国内 DNS 绕行主机列表。
+func (p TunProfile) EffectiveCNResolverHosts() []string {
+	return CNResolverHosts(p.CnDNS)
 }
 
 // EffectiveRemoteResolver 境外 DNS 地址。

@@ -72,7 +72,7 @@ export interface PlatformFeatures {
   login_autostart?: boolean
 }
 
-const api = axios.create({ baseURL: '/api' })
+const api = axios.create({ baseURL: '/api', timeout: 8000 })
 
 export function apiErrorMessage(err: unknown, fallback: string): string {
   if (axios.isAxiosError(err)) {
@@ -146,8 +146,8 @@ export interface TunProfile {
   bind_interface?: string
   bind_interface_candidates?: string[]
   bind_interface_effective?: string
-  cn_dns?: string
-  cn_dns_default?: string
+  cn_dns?: string[]
+  cn_dns_default?: string[]
   remote_dns?: string
   remote_dns_default?: string
   fakedns_domains?: string[]
