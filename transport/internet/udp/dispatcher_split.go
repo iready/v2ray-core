@@ -30,88 +30,143 @@ type Dispatcher struct {
 	conns      map[net.Destination]*connEntry
 	dispatcher routing.Dispatcher
 	callback   ResponseCallback
+	idle       time.Duration
 }
 
+const defaultSplitIdle = 5 * time.Minute
+
 func (v *Dispatcher) Close() error {
+	v.Lock()
+	entries := make([]*connEntry, 0, len(v.conns))
+	for dest, entry := range v.conns {
+		entries = append(entries, entry)
+		delete(v.conns, dest)
+	}
+	v.Unlock()
+	for _, entry := range entries {
+		v.terminateEntry(entry)
+	}
 	return nil
 }
 
+func (v *Dispatcher) terminateEntry(entry *connEntry) {
+	if entry == nil {
+		return
+	}
+	if entry.cancel != nil {
+		entry.cancel()
+	}
+	if entry.link != nil {
+		common.Close(entry.link.Reader)
+		common.Close(entry.link.Writer)
+		entry.link = nil
+	}
+}
+
 func NewSplitDispatcher(dispatcher routing.Dispatcher, callback ResponseCallback) DispatcherI {
+	return NewSplitDispatcherWithIdle(dispatcher, callback, defaultSplitIdle)
+}
+
+// NewSplitDispatcherWithIdle 为每个目的地出站设置空闲回收时间（TUN 应显著短于默认 5m，避免 ListenPacket 堆积）。
+func NewSplitDispatcherWithIdle(dispatcher routing.Dispatcher, callback ResponseCallback, idle time.Duration) DispatcherI {
+	if idle <= 0 {
+		idle = defaultSplitIdle
+	}
 	return &Dispatcher{
 		conns:      make(map[net.Destination]*connEntry),
 		dispatcher: dispatcher,
 		callback:   callback,
+		idle:       idle,
 	}
 }
 
 func (v *Dispatcher) RemoveRay(dest net.Destination) {
 	v.Lock()
-	defer v.Unlock()
-	if conn, found := v.conns[dest]; found {
-		common.Close(conn.link.Reader)
-		common.Close(conn.link.Writer)
+	entry, found := v.conns[dest]
+	if found {
 		delete(v.conns, dest)
+	}
+	v.Unlock()
+	if found {
+		v.terminateEntry(entry)
 	}
 }
 
-func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) *connEntry {
+func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*connEntry, error) {
 	v.Lock()
-	defer v.Unlock()
-
 	if entry, found := v.conns[dest]; found {
-		return entry
+		v.Unlock()
+		return entry, nil
 	}
-
-	newError("establishing new connection for ", dest).WriteToLog()
+	v.Unlock()
 
 	ctx, cancel := context.WithCancel(ctx)
 	removeRay := func() {
-		cancel()
 		v.RemoveRay(dest)
 	}
-	timer := signal.CancelAfterInactivity(ctx, removeRay, time.Second*300)
-	link, _ := v.dispatcher.Dispatch(ctx, dest)
+	timer := signal.CancelAfterInactivity(ctx, removeRay, v.idle)
+	link, err := v.dispatcher.Dispatch(ctx, dest)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	entry := &connEntry{
 		link:   link,
 		timer:  timer,
-		cancel: removeRay,
+		cancel: cancel,
+	}
+
+	v.Lock()
+	if existing, found := v.conns[dest]; found {
+		v.Unlock()
+		cancel()
+		common.Close(link.Reader)
+		common.Close(link.Writer)
+		return existing, nil
 	}
 	v.conns[dest] = entry
-	go handleInput(ctx, entry, dest, v.callback)
-	return entry
+	v.Unlock()
+	go handleInput(ctx, entry, dest, v.callback, func() { v.RemoveRay(dest) })
+	return entry, nil
 }
 
 func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, payload *buf.Buffer) {
-	// TODO: Add user to destString
-	newError("dispatch request to: ", destination).AtDebug().WriteToLog(session.ExportIDToError(ctx))
-
-	conn := v.getInboundRay(ctx, destination)
+	conn, err := v.getInboundRay(ctx, destination)
+	if err != nil {
+		payload.Release()
+		newError("failed to dispatch UDP payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		return
+	}
 	outputStream := conn.link.Writer
 	if outputStream != nil {
 		if err := outputStream.WriteMultiBuffer(buf.MultiBuffer{payload}); err != nil {
 			newError("failed to write first UDP payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
-			conn.cancel()
+			v.RemoveRay(destination)
 			return
 		}
+		conn.timer.Update()
 	}
 }
 
-func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, callback ResponseCallback) {
-	defer conn.cancel()
+func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, callback ResponseCallback, remove func()) {
+	defer remove()
 
 	input := conn.link.Reader
 	timer := conn.timer
 
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		mb, err := input.ReadMultiBuffer()
 		if err != nil {
 			newError("failed to handle UDP input").Base(err).WriteToLog(session.ExportIDToError(ctx))
+			return
+		}
+		if ctx.Err() != nil {
+			buf.ReleaseMulti(mb)
+			return
+		}
+		if mb.IsEmpty() {
+			// 空读视为出站结束；忙等会在 blackhole/异常链路上打满 CPU
+			buf.ReleaseMulti(mb)
 			return
 		}
 		timer.Update()

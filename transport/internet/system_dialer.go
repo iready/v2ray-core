@@ -54,13 +54,19 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		if err != nil {
 			return nil, err
 		}
+		// ListenPacket 不会随 ctx 结束而关闭。TUN 每条 UDP 一个套接字，
+		// 空闲取消若只停在拷贝协程，Windows 上句柄会一直留着。
+		stop := context.AfterFunc(ctx, func() { _ = packetConn.Close() })
 		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
 		if err != nil {
+			stop()
+			_ = packetConn.Close()
 			return nil, err
 		}
 		return &packetConnWrapper{
 			conn: packetConn,
 			dest: destAddr,
+			stop: stop,
 		}, nil
 	}
 	goStdKeepAlive := time.Duration(0)
@@ -111,9 +117,13 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 type packetConnWrapper struct {
 	conn net.PacketConn
 	dest net.Addr
+	stop func() bool
 }
 
 func (c *packetConnWrapper) Close() error {
+	if c.stop != nil {
+		c.stop()
+	}
 	return c.conn.Close()
 }
 
