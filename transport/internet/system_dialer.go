@@ -11,6 +11,14 @@ import (
 
 var effectiveSystemDialer SystemDialer = &DefaultSystemDialer{}
 
+// udpFamAddr 让 ListenPacket 走 udp4/udp6。*net.UDPAddr.Network() 固定返回 "udp"。
+type udpFamAddr struct {
+	*net.UDPAddr
+	network string
+}
+
+func (a *udpFamAddr) Network() string { return a.network }
+
 type SystemDialer interface {
 	Dial(ctx context.Context, source net.Address, destination net.Destination, sockopt *SocketConfig) (net.Conn, error)
 }
@@ -43,24 +51,37 @@ func hasBindAddr(sockopt *SocketConfig) bool {
 
 func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
 	if dest.Network == net.Network_UDP && !hasBindAddr(sockopt) {
+		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
+		if err != nil {
+			return nil, err
+		}
+		// Windows 上 "udp"+0.0.0.0 是双栈，一条 IPv4 DNS 会再占一个 [::] 套接字。按目的地址只听一边。
+		fam := "udp4"
+		if destAddr.IP != nil && destAddr.IP.To4() == nil {
+			fam = "udp6"
+		}
 		srcAddr := resolveSrcAddr(net.Network_UDP, src)
 		if srcAddr == nil {
-			srcAddr = &net.UDPAddr{
-				IP:   []byte{0, 0, 0, 0},
-				Port: 0,
+			if fam == "udp6" {
+				srcAddr = &net.UDPAddr{IP: make(net.IP, net.IPv6len), Port: 0}
+			} else {
+				srcAddr = &net.UDPAddr{IP: net.IP{0, 0, 0, 0}, Port: 0}
 			}
+		}
+		if ua, ok := srcAddr.(*net.UDPAddr); ok {
+			srcAddr = &udpFamAddr{UDPAddr: ua, network: fam}
 		}
 		packetConn, err := ListenSystemPacket(ctx, srcAddr, sockopt)
 		if err != nil {
 			return nil, err
 		}
-		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
-		if err != nil {
-			return nil, err
-		}
+		// ListenPacket 不会随 ctx 结束而关闭。TUN 每条 UDP 一个套接字，
+		// 空闲取消若只停在拷贝协程，Windows 上句柄会一直留着。
+		stop := context.AfterFunc(ctx, func() { _ = packetConn.Close() })
 		return &packetConnWrapper{
 			conn: packetConn,
 			dest: destAddr,
+			stop: stop,
 		}, nil
 	}
 	goStdKeepAlive := time.Duration(0)
@@ -111,9 +132,13 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 type packetConnWrapper struct {
 	conn net.PacketConn
 	dest net.Addr
+	stop func() bool
 }
 
 func (c *packetConnWrapper) Close() error {
+	if c.stop != nil {
+		c.stop()
+	}
 	return c.conn.Close()
 }
 

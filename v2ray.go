@@ -287,9 +287,16 @@ func (s *Instance) Close() error {
 	s.running = false
 
 	var errors []interface{}
-	for _, f := range s.features {
-		if err := f.Close(); err != nil {
-			errors = append(errors, err)
+	// Stop traffic capture before closing the features it dispatches into.
+	for _, first := range []bool{true, false} {
+		for _, f := range s.features {
+			_, late := f.(interface{ StartAfterDependencies() })
+			if late != first {
+				continue
+			}
+			if err := f.Close(); err != nil {
+				errors = append(errors, err)
+			}
 		}
 	}
 	if len(errors) > 0 {
@@ -371,9 +378,16 @@ func (s *Instance) Start() error {
 	defer s.access.Unlock()
 
 	s.running = true
-	for _, f := range s.features {
-		if err := f.Start(); err != nil {
-			return err
+	// Start traffic-capturing services only after dispatcher, DNS and outbounds are running.
+	for _, last := range []bool{false, true} {
+		for _, f := range s.features {
+			_, late := f.(interface{ StartAfterDependencies() })
+			if late != last {
+				continue
+			}
+			if err := f.Start(); err != nil {
+				return err
+			}
 		}
 	}
 

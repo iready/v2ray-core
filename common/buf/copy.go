@@ -2,6 +2,7 @@ package buf
 
 import (
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/v2fly/v2ray-core/v5/common/errors"
@@ -37,6 +38,13 @@ func CountSize(sc *SizeCounter) CopyOption {
 		handler.onData = append(handler.onData, func(b MultiBuffer) {
 			sc.Size += int64(b.Len())
 		})
+	}
+}
+
+// CountAtomic adds byte totals without logging or allocating per packet.
+func CountAtomic(counter *atomic.Uint64) CopyOption {
+	return func(h *copyHandler) {
+		h.onData = append(h.onData, func(b MultiBuffer) { counter.Add(uint64(b.Len())) })
 	}
 }
 

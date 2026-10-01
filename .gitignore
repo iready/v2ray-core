@@ -30,3 +30,17 @@ errorgen
 [._]*.un~
 
 .golangci.yml
+
+# localadmin frontend build output
+main/z/localadmin/web/dist/
+main/z/localadmin/web/node_modules/
+
+# 构建时本地配置与注入材料，不入库
+.build.local
+.build.prefs.local
+.build-mtls.local
+main/z/wire/certs/root_ca.pem
+main/z/wire/certs/client.p12
+main/z/wire/certs/client.p12.pass
+/hook-deploy.log
+build/

@@ -81,10 +81,22 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher) (*DoHNameServ
 	return s, nil
 }
 
-// NewDoHLocalNameServer creates DOH client object for local resolving
-func NewDoHLocalNameServer(url *url.URL) *DoHNameServer {
-	url.Scheme = "https"
-	s := baseDOHNameServer(url, "DOHL")
+var (
+	localDoHMu sync.Mutex
+	localDoHs  []*DoHNameServer
+)
+
+// ResetLocalDoH 丢掉本机 DoH 连接。换了本机地址后，旧连接仍钉着原来的源地址，读会一直卡住。
+func ResetLocalDoH() {
+	localDoHMu.Lock()
+	list := append([]*DoHNameServer(nil), localDoHs...)
+	localDoHMu.Unlock()
+	for _, s := range list {
+		s.replaceLocalClient()
+	}
+}
+
+func newLocalDoHClient() *http.Client {
 	tr := &http.Transport{
 		IdleConnTimeout:   90 * time.Second,
 		ForceAttemptHTTP2: true,
@@ -100,10 +112,37 @@ func NewDoHLocalNameServer(url *url.URL) *DoHNameServer {
 			return conn, nil
 		},
 	}
-	s.httpClient = &http.Client{
-		Timeout:   time.Second * 180,
+	return &http.Client{
+		Timeout:   5 * time.Second,
 		Transport: tr,
 	}
+}
+
+func (s *DoHNameServer) replaceLocalClient() {
+	next := newLocalDoHClient()
+	s.Lock()
+	old := s.httpClient
+	s.httpClient = next
+	s.Unlock()
+	if old != nil {
+		old.CloseIdleConnections()
+	}
+}
+
+func (s *DoHNameServer) http() *http.Client {
+	s.RLock()
+	defer s.RUnlock()
+	return s.httpClient
+}
+
+// NewDoHLocalNameServer creates DOH client object for local resolving
+func NewDoHLocalNameServer(url *url.URL) *DoHNameServer {
+	url.Scheme = "https"
+	s := baseDOHNameServer(url, "DOHL")
+	s.httpClient = newLocalDoHClient()
+	localDoHMu.Lock()
+	localDoHs = append(localDoHs, s)
+	localDoHMu.Unlock()
 	newError("DNS: created Local DOH client for ", url.String()).AtInfo().WriteToLog()
 	return s
 }
@@ -191,6 +230,14 @@ func (s *DoHNameServer) updateIP(req *dnsRequest, ipRec *IPRecord) {
 	if updated {
 		s.ips[req.domain] = rec
 	}
+	var extraIPs []net.IP
+	if updated && req.reqType == dnsmessage.TypeA && rec.A != nil {
+		for _, addr := range rec.A.IP {
+			if ip := addr.IP(); len(ip) > 0 {
+				extraIPs = append(extraIPs, append(net.IP(nil), ip...))
+			}
+		}
+	}
 	switch req.reqType {
 	case dnsmessage.TypeA:
 		s.pub.Publish(req.domain+"4", nil)
@@ -198,6 +245,9 @@ func (s *DoHNameServer) updateIP(req *dnsRequest, ipRec *IPRecord) {
 		s.pub.Publish(req.domain+"6", nil)
 	}
 	s.Unlock()
+	if hook := ExtraBypassAHook; hook != nil && len(extraIPs) > 0 {
+		hook(req.domain, extraIPs)
+	}
 	common.Must(s.cleanup.Start())
 }
 
@@ -270,7 +320,7 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 	req.Header.Add("Accept", "application/dns-message")
 	req.Header.Add("Content-Type", "application/dns-message")
 
-	resp, err := s.httpClient.Do(req.WithContext(ctx))
+	resp, err := s.http().Do(req.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}

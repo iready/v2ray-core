@@ -21,6 +21,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/features/routing"
 	routing_session "github.com/v2fly/v2ray-core/v5/features/routing/session"
 	"github.com/v2fly/v2ray-core/v5/features/stats"
+	"github.com/v2fly/v2ray-core/v5/main/z/connlog"
 	"github.com/v2fly/v2ray-core/v5/transport"
 	"github.com/v2fly/v2ray-core/v5/transport/pipe"
 )
@@ -265,6 +266,9 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 			default:
 				cachingStartingTimeStamp := time.Now()
 				cacheErr := cReader.Cache(payload, cacheDeadline)
+				if cacheErr != nil && cacheErr != buf.ErrReadTimeout {
+					return nil, cacheErr
+				}
 				cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
 				cacheDeadline -= cachingTimeElapsed
 
@@ -307,6 +311,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			handler = h
 		} else {
 			newError("non existing tag for platform initialized detour: ", forcedOutboundTag).AtError().WriteToLog(session.ExportIDToError(ctx))
+			connlog.Fail(forcedOutboundTag, destination.String(), "出站不存在")
 			common.Close(link.Writer)
 			common.Interrupt(link.Reader)
 			return
@@ -344,6 +349,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 
 	if handler == nil {
 		newError("default outbound handler not exist").WriteToLog(session.ExportIDToError(ctx))
+		connlog.Fail("", destination.String(), "没有默认出站")
 		common.Close(link.Writer)
 		common.Interrupt(link.Reader)
 		return

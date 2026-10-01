@@ -2,6 +2,7 @@ package internet
 
 import (
 	"net"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -45,15 +46,8 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 	}
 
 	if config.BindToDevice != "" {
-		iface, err := net.InterfaceByName(config.BindToDevice)
-		if err != nil {
-			return newError("failed to get interface ", config.BindToDevice).Base(err)
-		}
-		if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, iface.Index); err != nil {
-			return newError("failed to set IP_BOUND_IF", err)
-		}
-		if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, iface.Index); err != nil {
-			return newError("failed to set IPV6_BOUND_IF", err)
+		if err := applyDarwinBindToDevice(network, fd, config.BindToDevice); err != nil {
+			return err
 		}
 	}
 
@@ -102,15 +96,8 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 	}
 
 	if config.BindToDevice != "" {
-		iface, err := net.InterfaceByName(config.BindToDevice)
-		if err != nil {
-			return newError("failed to get interface ", config.BindToDevice).Base(err)
-		}
-		if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, iface.Index); err != nil {
-			return newError("failed to set IP_BOUND_IF", err)
-		}
-		if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, iface.Index); err != nil {
-			return newError("failed to set IPV6_BOUND_IF", err)
+		if err := applyDarwinBindToDevice(network, fd, config.BindToDevice); err != nil {
+			return err
 		}
 	}
 
@@ -124,6 +111,23 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, int(config.RxBufSize)); err != nil {
 			return newError("failed to set SO_RCVBUF/SO_RCVBUFFORCE").Base(err)
 		}
+	}
+	return nil
+}
+
+func applyDarwinBindToDevice(network string, fd uintptr, device string) error {
+	iface, err := net.InterfaceByName(device)
+	if err != nil {
+		return newError("failed to get interface ", device).Base(err)
+	}
+	if strings.HasSuffix(network, "6") {
+		if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, iface.Index); err != nil {
+			return newError("failed to set IPV6_BOUND_IF", err)
+		}
+		return nil
+	}
+	if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, iface.Index); err != nil {
+		return newError("failed to set IP_BOUND_IF", err)
 	}
 	return nil
 }

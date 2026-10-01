@@ -18,6 +18,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/features/outbound"
 	"github.com/v2fly/v2ray-core/v5/features/policy"
 	"github.com/v2fly/v2ray-core/v5/features/stats"
+	"github.com/v2fly/v2ray-core/v5/main/z/connlog"
 	"github.com/v2fly/v2ray-core/v5/proxy"
 	"github.com/v2fly/v2ray-core/v5/transport"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
@@ -151,6 +152,7 @@ func (h *Handler) Tag() string {
 
 // Dispatch implements proxy.Outbound.Dispatch.
 func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
+	recID := connlog.Begin(h.tag, outboundTarget(ctx))
 	if h.senderSettings != nil && h.senderSettings.DomainStrategy != proxyman.SenderConfig_AS_IS {
 		outbound := session.OutboundFromContext(ctx)
 		if outbound == nil {
@@ -166,22 +168,37 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 	if h.mux != nil && (h.mux.Enabled || session.MuxPreferedFromContext(ctx)) {
 		if err := h.mux.Dispatch(ctx, link); err != nil {
 			err := newError("failed to process mux outbound traffic").Base(err)
+			connlog.End(recID, err)
+			connlog.Note(h.tag, outboundTarget(ctx), err)
 			session.SubmitOutboundErrorToOriginator(ctx, err)
 			err.WriteToLog(session.ExportIDToError(ctx))
 			common.Interrupt(link.Writer)
+		} else {
+			connlog.End(recID, nil)
 		}
 	} else {
 		if err := h.proxy.Process(ctx, link, h); err != nil {
 			// Ensure outbound ray is properly closed.
 			err := newError("failed to process outbound traffic").Base(err)
+			connlog.End(recID, err)
+			connlog.Note(h.tag, outboundTarget(ctx), err)
 			session.SubmitOutboundErrorToOriginator(ctx, err)
 			err.WriteToLog(session.ExportIDToError(ctx))
 			common.Interrupt(link.Writer)
 		} else {
+			connlog.End(recID, nil)
 			common.Must(common.Close(link.Writer))
 		}
 		common.Interrupt(link.Reader)
 	}
+}
+
+func outboundTarget(ctx context.Context) string {
+	ob := session.OutboundFromContext(ctx)
+	if ob == nil || !ob.Target.IsValid() {
+		return ""
+	}
+	return ob.Target.String()
 }
 
 // Address implements internet.Dialer.

@@ -1,0 +1,237 @@
+package rocket
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/v2fly/v2ray-core/v5/main/z/applog"
+	pb "github.com/v2fly/v2ray-core/v5/main/z/proto"
+	"github.com/v2fly/v2ray-core/v5/main/z/tunctl"
+	"github.com/v2fly/v2ray-core/v5/main/z/wire"
+)
+
+// AgentHooks v2fly_wire 推送回调。
+type AgentHooks struct {
+	OnConfig            func(*pb.GetConfigRes)
+	OnExecute           func([]*pb.Execute)
+	OnDomainRouteStatus func(wire.DomainRouteStatusPush)
+	OnHTTPFetch         func(wire.HTTPFetchPush)
+	OnWireReady         func()
+}
+
+func (rs *RS) machineName() string {
+	host, _ := os.Hostname()
+	if host == "" {
+		return "v2fly-agent"
+	}
+	return host
+}
+
+// ConnectHello 建连并 hello。劫持路由只由 tunctl.WithWireDial 同步，不在这里单独 Suspend/Resume。
+func (rs *RS) ConnectHello(ctx context.Context) (*pb.GetConfigRes, error) {
+	rs.wireDialMu.Lock()
+	defer rs.wireDialMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rs.statusMu.RLock()
+	addr, token, sign, tls := rs.Address, rs.Token, rs.Sign, rs.WireTLS
+	rs.statusMu.RUnlock()
+	var payload *pb.GetConfigRes
+	err := tunctl.WithWireDial(func() error {
+		rs.disconnectWire()
+		client, err := wire.Dial(addr, token, sign, tls)
+		if err != nil {
+			rs.setWireError(err)
+			return err
+		}
+		rs.statusMu.Lock()
+		rs.wireClient = client
+		rs.statusMu.Unlock()
+		client.Start()
+		p, err := client.Hello(ctx, rs.machineName())
+		if err != nil {
+			rs.disconnectWire()
+			rs.setWireError(err)
+			return err
+		}
+		rs.setWireConnected(true)
+		payload = p.ToGetConfigRes()
+		return nil
+	})
+	return payload, err
+}
+
+// Reconnect 断开并重新 hello（供本地后台触发）。
+func (rs *RS) Reconnect(ctx context.Context) (*pb.GetConfigRes, error) {
+	return rs.ConnectHello(ctx)
+}
+
+// ConnectHelloRetry 重试直到成功或 ctx 取消。
+func (rs *RS) ConnectHelloRetry(ctx context.Context, interval time.Duration) (*pb.GetConfigRes, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		cfg, err := rs.ConnectHello(ctx)
+		if err == nil {
+			return cfg, nil
+		}
+		if sleepOrDone(ctx, interval) {
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (rs *RS) DisconnectWire() { rs.disconnectWire() }
+
+func (rs *RS) currentWire() *wire.Client {
+	rs.statusMu.RLock()
+	defer rs.statusMu.RUnlock()
+	return rs.wireClient
+}
+
+func (rs *RS) disconnectWire() {
+	rs.statusMu.Lock()
+	client := rs.wireClient
+	rs.wireClient = nil
+	rs.wireConnected = false
+	rs.statusMu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
+}
+
+func (rs *RS) reportExecuteResult(ctx context.Context, exec *pb.Execute, execErr error) {
+	client := rs.currentWire()
+	if client == nil {
+		return
+	}
+	msg, ok := "执行成功", true
+	if execErr != nil {
+		msg, ok = execErr.Error(), false
+	}
+	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_ = client.UploadExecuteResult(tctx, exec.Id, msg, ok)
+}
+
+// AppliedTokenVersion 返回 agent 已成功应用的配置版本（供 ping 上报）。
+func (rs *RS) AppliedTokenVersion() int32 {
+	return rs.Version()
+}
+
+// SubmitDomainRouteRequest 经 Wire 上报域名录入申请。
+func (rs *RS) SubmitDomainRouteRequest(ctx context.Context, domains []string, remark, clientReqID string) (string, error) {
+	client := rs.currentWire()
+	if client == nil {
+		return "", fmt.Errorf("wire 未连接")
+	}
+	res, err := client.SubmitDomainRouteRequest(ctx, domains, remark, clientReqID)
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "", fmt.Errorf("empty response")
+	}
+	return res.RequestID, nil
+}
+
+// WireConnected 当前是否持有 Wire 客户端。
+func (rs *RS) WireClient() *wire.Client { return rs.currentWire() }
+
+func (rs *RS) WireConnected() bool {
+	return rs.currentWire() != nil
+}
+
+// ReloadConfig 停实例、按新配置重启并更新 token 版本。
+// 第二个返回值表示是否实际执行了重载（false 表示版本未变而跳过）。
+func (rs *RS) ReloadConfig(cfg *pb.GetConfigRes) (bool, error) {
+	if cfg == nil || (cfg.R != nil && cfg.R.Code != pb.Code_OK) {
+		return false, nil
+	}
+	return rs.applyConfig(cfg, false)
+}
+
+// RunAgent 阻塞：维持 WS 长连接，断线指数退避重连。
+// 本地实例与缓存配置不随 Wire 断开而停。服务端更新掉控制面时保持 TUN。
+func (rs *RS) RunAgent(ctx context.Context, hooks AgentHooks) {
+	backoff := 5 * time.Second
+	const maxBackoff = 2 * time.Minute
+
+	for {
+		if err := ctx.Err(); err != nil {
+			log.Println("agent 退出:", err)
+			return
+		}
+
+		if rs.currentWire() == nil {
+			connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			cfg, err := rs.ConnectHello(connectCtx)
+			cancel()
+			if err != nil {
+				applog.LimitedPrintf("wire_connect_failure", "wire 连接失败: %v", err)
+				if sleepOrDone(ctx, backoff) {
+					return
+				}
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
+			backoff = 5 * time.Second
+			if hooks.OnConfig != nil && cfg != nil {
+				hooks.OnConfig(cfg)
+			}
+			if hooks.OnWireReady != nil {
+				hooks.OnWireReady()
+			}
+		}
+
+		sessionErr := rs.runWireSession(ctx, hooks)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("wire 断开: %v，%v 后重连", sessionErr, backoff)
+		rs.disconnectWire()
+		if sleepOrDone(ctx, backoff) {
+			return
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
+}
+
+func (rs *RS) runWireSession(ctx context.Context, hooks AgentHooks) error {
+	client := rs.currentWire()
+	if client == nil {
+		return fmt.Errorf("wire: not connected")
+	}
+	client.SetPushHandlers(
+		func(p *wire.ConfigPayload) {
+			if p == nil || !p.Ok {
+				return
+			}
+			if hooks.OnConfig != nil {
+				hooks.OnConfig(p.ToGetConfigRes())
+			}
+		},
+		hooks.OnExecute,
+		hooks.OnDomainRouteStatus,
+		hooks.OnHTTPFetch,
+	)
+	if hooks.OnWireReady != nil {
+		hooks.OnWireReady()
+	}
+	client.StartPingLoop(ctx, rs.AppliedTokenVersion)
+	return client.Wait(ctx)
+}
+
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
