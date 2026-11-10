@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/v2fly/v2ray-core/v5/app/proxyman"
@@ -171,6 +172,10 @@ func (h *Handler) handleTCP(ctx context.Context, conn net.Conn, source M.Socksad
 	inboundCtx = h.withSniffing(inboundCtx)
 	inboundCtx = h.withDNSHijack(inboundCtx, dest)
 
+	started := time.Now()
+	var up, down atomic.Uint64
+	defer logTCPFlow(inboundCtx, dest, started, &up, &down)
+
 	inboundCtx, cancel := context.WithCancel(inboundCtx)
 	defer cancel()
 	timer := signal.CancelAfterInactivity(inboundCtx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
@@ -186,14 +191,14 @@ func (h *Handler) handleTCP(ctx context.Context, conn net.Conn, source M.Socksad
 
 	responseDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
-		if err := buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer), buf.CountAtomic(&DownloadBytes)); err != nil {
+		if err := buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer), buf.CountAtomic(&down), buf.CountAtomic(&DownloadBytes)); err != nil {
 			return err
 		}
 		return nil
 	}
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		if err := buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer), buf.CountAtomic(&UploadBytes)); err != nil {
+		if err := buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer), buf.CountAtomic(&up), buf.CountAtomic(&UploadBytes)); err != nil {
 			return err
 		}
 		return nil
@@ -205,6 +210,24 @@ func (h *Handler) handleTCP(ctx context.Context, conn net.Conn, source M.Socksad
 		return err
 	}
 	return nil
+}
+
+func logTCPFlow(ctx context.Context, dest v2net.Destination, started time.Time, up, down *atomic.Uint64) {
+	upN, downN := up.Load(), down.Load()
+	elapsed := time.Since(started)
+	if upN < 256*1024 && elapsed < 3*time.Second {
+		return
+	}
+	via := ""
+	if msg := log.AccessMessageFromContext(ctx); msg != nil {
+		via = msg.Detour
+	}
+	secs := elapsed.Seconds()
+	if secs < 0.001 {
+		secs = 0.001
+	}
+	applog.LimitedPrintf("tun_tcp_flow:"+dest.String(), "tun tcp %s via=%s up=%d down=%d 用时 %s 上行 %.0f KB/s",
+		dest, via, upN, downN, elapsed.Round(time.Millisecond), float64(upN)/1024/secs)
 }
 
 func (h *Handler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -257,6 +280,7 @@ func (h *Handler) handleUDP(ctx context.Context, conn N.PacketConn, source M.Soc
 	defer common.Close(udpServer)
 
 	_ = conn.SetReadDeadline(time.Now().Add(idle))
+	seenPacket := false
 	for {
 		buffer := singbuf.NewPacket()
 		remote, err := conn.ReadPacket(buffer)
@@ -273,6 +297,10 @@ func (h *Handler) handleUDP(ctx context.Context, conn N.PacketConn, source M.Soc
 			return err
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(idle))
+		if !seenPacket {
+			seenPacket = true
+			h.noteQUICDrop(source, remote)
+		}
 		UploadBytes.Add(uint64(buffer.Len()))
 		payload := buf.NewWithSize(int32(buffer.Len()))
 		_, _ = payload.Write(buffer.Bytes())
@@ -282,6 +310,17 @@ func (h *Handler) handleUDP(ctx context.Context, conn N.PacketConn, source M.Soc
 		pktCtx := h.withDNSHijack(inboundCtx, dest)
 		udpServer.Dispatch(pktCtx, dest, payload)
 	}
+}
+
+func (h *Handler) noteQUICDrop(source, remote M.Socksaddr) {
+	if h.router == nil || remote.Port != 443 {
+		return
+	}
+	tag, _ := h.resolveOutboundTag(N.NetworkUDP, source, remote)
+	if tag != "blackhole" {
+		return
+	}
+	applog.LimitedPrintf("tun_quic_drop:"+remote.String(), "tun udp %s QUIC 已丢弃", remote)
 }
 
 func (h *Handler) withSniffing(ctx context.Context) context.Context {

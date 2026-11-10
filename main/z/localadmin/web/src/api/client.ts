@@ -118,8 +118,6 @@ export function tunHijackPausedLabel(paused?: string): string {
       return '用户已关闭'
     case 'engine_off':
       return '网卡未运行'
-    case 'wire_dial':
-      return '控制面重连，暂直出'
     case 'iface_gone':
       return '默认网卡丢失，暂直出'
     case 'cn_outage':

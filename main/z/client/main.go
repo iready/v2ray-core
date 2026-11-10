@@ -473,7 +473,7 @@ func (rt *runtime) rebootstrap() error {
 	ctx, cancel := context.WithTimeout(rt.ctx, 45*time.Second)
 	defer cancel()
 
-	// 先 hello（WithWireDial 统一同步劫持路由），拿到配置后再停旧启新。
+	// 先 hello，拿到配置后再停旧启新。控制面重连不暂停本地劫持。
 	serverCfg, err := rs.Reconnect(ctx)
 	if err != nil {
 		return err

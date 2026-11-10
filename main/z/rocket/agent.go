@@ -30,7 +30,7 @@ func (rs *RS) machineName() string {
 	return host
 }
 
-// ConnectHello 建连并 hello。劫持路由只由 tunctl.WithWireDial 同步，不在这里单独 Suspend/Resume。
+// ConnectHello 建连并 hello。控制面重连不暂停本地劫持。
 func (rs *RS) ConnectHello(ctx context.Context) (*pb.GetConfigRes, error) {
 	rs.wireDialMu.Lock()
 	defer rs.wireDialMu.Unlock()
@@ -40,29 +40,28 @@ func (rs *RS) ConnectHello(ctx context.Context) (*pb.GetConfigRes, error) {
 	rs.statusMu.RLock()
 	addr, token, sign, tls := rs.Address, rs.Token, rs.Sign, rs.WireTLS
 	rs.statusMu.RUnlock()
-	var payload *pb.GetConfigRes
-	err := tunctl.WithWireDial(func() error {
+
+	rs.disconnectWire()
+	client, err := wire.Dial(addr, token, sign, tls)
+	if err != nil {
+		rs.setWireError(err)
+		tunctl.NoteWireDialResult(err)
+		return nil, err
+	}
+	rs.statusMu.Lock()
+	rs.wireClient = client
+	rs.statusMu.Unlock()
+	client.Start()
+	p, err := client.Hello(ctx, rs.machineName())
+	if err != nil {
 		rs.disconnectWire()
-		client, err := wire.Dial(addr, token, sign, tls)
-		if err != nil {
-			rs.setWireError(err)
-			return err
-		}
-		rs.statusMu.Lock()
-		rs.wireClient = client
-		rs.statusMu.Unlock()
-		client.Start()
-		p, err := client.Hello(ctx, rs.machineName())
-		if err != nil {
-			rs.disconnectWire()
-			rs.setWireError(err)
-			return err
-		}
-		rs.setWireConnected(true)
-		payload = p.ToGetConfigRes()
-		return nil
-	})
-	return payload, err
+		rs.setWireError(err)
+		tunctl.NoteWireDialResult(err)
+		return nil, err
+	}
+	rs.setWireConnected(true)
+	tunctl.NoteWireDialResult(nil)
+	return p.ToGetConfigRes(), nil
 }
 
 // Reconnect 断开并重新 hello（供本地后台触发）。

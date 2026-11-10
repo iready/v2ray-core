@@ -1,6 +1,10 @@
 package tunctl
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
 
 func TestHijackWanted(t *testing.T) {
 	cases := []struct {
@@ -9,10 +13,8 @@ func TestHijackWanted(t *testing.T) {
 	}{
 		{hijackInputs{enabled: true}, true},
 		{hijackInputs{}, false},
-		{hijackInputs{enabled: true, wireDialing: true}, false},
 		{hijackInputs{enabled: true, ifaceGone: true}, false},
 		{hijackInputs{enabled: true, cnOutage: true}, false},
-		{hijackInputs{enabled: true, wireDialing: true, cnOutage: true}, false},
 	}
 	for i, tc := range cases {
 		if got := hijackWanted(tc.in); got != tc.want {
@@ -29,7 +31,6 @@ func TestHijackPausedReason(t *testing.T) {
 		want string
 	}{
 		{hijackInputs{enabled: true}, ""},
-		{hijackInputs{enabled: true, wireDialing: true}, HijackPausedWireDial},
 		{hijackInputs{enabled: true, ifaceGone: true}, HijackPausedIfaceGone},
 		{hijackInputs{enabled: true, cnOutage: true}, HijackPausedCNOutage},
 		{hijackInputs{}, HijackPausedEngineOff},
@@ -60,5 +61,58 @@ func TestCNOutageFollowsGateway(t *testing.T) {
 	}
 	if cnOutageActive(false, "192.168.1.1", "192.168.1.1") {
 		t.Fatal("successful judgement is not an outage")
+	}
+}
+
+func TestNoteWireDialDoesNotNeedGatewayToReturn(t *testing.T) {
+	resetHijackBits()
+	t.Cleanup(resetHijackBits)
+
+	hijackMu.Lock()
+	hijackBits.cnOutage = true
+	hijackBits.cnOutageGateway = "192.168.1.1"
+	hijackBits.physicalGateway = "192.168.1.1"
+	hijackMu.Unlock()
+
+	NoteWireDialResult(nil)
+	if liveHijackInputs().cnOutage {
+		t.Fatal("successful dial should clear cn outage")
+	}
+
+	hijackMu.Lock()
+	hijackBits.physicalGateway = ""
+	hijackMu.Unlock()
+	NoteWireDialResult(errors.New("dial"))
+	if liveHijackInputs().cnOutage {
+		t.Fatal("dial failure without a default gateway must not mark cn outage")
+	}
+}
+
+func TestIfaceGoneDebounce(t *testing.T) {
+	resetHijackBits()
+	old := ifaceGoneDebounce
+	ifaceGoneDebounce = 40 * time.Millisecond
+	t.Cleanup(func() {
+		ifaceGoneDebounce = old
+		resetHijackBits()
+	})
+
+	noteDefaultIface("")
+	if liveHijackInputs().ifaceGone {
+		t.Fatal("missing interface should not pause before the debounce")
+	}
+	noteDefaultIface("Ethernet")
+	if liveHijackInputs().ifaceGone {
+		t.Fatal("interface came back before the debounce")
+	}
+
+	noteDefaultIface("")
+	time.Sleep(150 * time.Millisecond)
+	if !liveHijackInputs().ifaceGone {
+		t.Fatal("missing interface should pause after the debounce")
+	}
+	noteDefaultIface("Ethernet")
+	if liveHijackInputs().ifaceGone {
+		t.Fatal("interface should resume immediately")
 	}
 }

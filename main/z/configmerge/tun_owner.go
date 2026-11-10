@@ -336,7 +336,7 @@ func firstDirectOutboundTag(doc map[string]interface{}) string {
 	return "direct"
 }
 
-// ensureTunBlockQUICRule 丢弃 TUN 上 UDP/443（QUIC），迫使浏览器回退 TCP；当前 UDP 转发未完备。
+// ensureTunBlockQUICRule 国内 QUIC 直连；其余 UDP/443 仍丢弃，迫使浏览器回退 TCP。
 func ensureTunBlockQUICRule(doc map[string]interface{}, tunTag string) {
 	routing, _ := doc["routing"].(map[string]interface{})
 	if routing == nil {
@@ -344,33 +344,66 @@ func ensureTunBlockQUICRule(doc map[string]interface{}, tunTag string) {
 		doc["routing"] = routing
 	}
 	rules, _ := routing["rules"].([]interface{})
-	if hasTunQUICBlockRule(rules, tunTag) {
-		return
+	directTag := firstDirectOutboundTag(doc)
+	if !hasTunCNQUICDirectRule(rules, tunTag, directTag) {
+		rules = append([]interface{}{map[string]interface{}{
+			"type":        "field",
+			"inboundTag":  []interface{}{tunTag},
+			"network":     "udp",
+			"port":        "443",
+			"ip":          []interface{}{"geoip:cn"},
+			"outboundTag": directTag,
+		}}, rules...)
 	}
-	rules = append([]interface{}{map[string]interface{}{
-		"type":        "field",
-		"inboundTag":  []interface{}{tunTag},
-		"network":     "udp",
-		"port":        "443",
-		"outboundTag": "blackhole",
-	}}, rules...)
+	if !hasTunQUICBlockRule(rules, tunTag) {
+		block := map[string]interface{}{
+			"type":        "field",
+			"inboundTag":  []interface{}{tunTag},
+			"network":     "udp",
+			"port":        "443",
+			"outboundTag": "blackhole",
+		}
+		at := indexTunCNQUICDirect(rules, tunTag, directTag) + 1
+		if at <= 0 {
+			at = 0
+		}
+		rules = append(rules[:at], append([]interface{}{block}, rules[at:]...)...)
+	}
 	routing["rules"] = rules
 	ensureBlackholeOutbound(doc)
+}
+
+func hasTunCNQUICDirectRule(rules []interface{}, tunTag, directTag string) bool {
+	return indexTunCNQUICDirect(rules, tunTag, directTag) >= 0
+}
+
+func indexTunCNQUICDirect(rules []interface{}, tunTag, directTag string) int {
+	for i, item := range rules {
+		rule, ok := item.(map[string]interface{})
+		if !ok || !isTunQUICRule(rule, tunTag) {
+			continue
+		}
+		if asString(rule["outboundTag"]) == directTag && ruleHasIP(rule, "geoip:cn") {
+			return i
+		}
+	}
+	return -1
+}
+
+func isTunQUICRule(rule map[string]interface{}, tunTag string) bool {
+	if !ruleMatchesInbound(rule, tunTag) {
+		return false
+	}
+	if !strings.EqualFold(asString(rule["network"]), "udp") {
+		return false
+	}
+	return asString(rule["port"]) == "443"
 }
 
 func hasTunQUICBlockRule(rules []interface{}, tunTag string) bool {
 	for _, item := range rules {
 		rule, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if !ruleMatchesInbound(rule, tunTag) {
-			continue
-		}
-		if !strings.EqualFold(asString(rule["network"]), "udp") {
-			continue
-		}
-		if asString(rule["port"]) != "443" {
+		if !ok || !isTunQUICRule(rule, tunTag) {
 			continue
 		}
 		if asString(rule["outboundTag"]) == "blackhole" {

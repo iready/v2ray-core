@@ -19,6 +19,7 @@ import (
 	"github.com/v2fly/v2ray-core/v5/common/task"
 	"github.com/v2fly/v2ray-core/v5/features/dns"
 	"github.com/v2fly/v2ray-core/v5/features/policy"
+	"github.com/v2fly/v2ray-core/v5/main/z/applog"
 	"github.com/v2fly/v2ray-core/v5/transport"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 )
@@ -254,11 +255,15 @@ func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string,
 		ttl = h.config.ResponseTtl
 	}
 
+	lookupAt := time.Now()
 	switch qType {
 	case dnsmessage.TypeA:
 		ips, err = h.ipv4Lookup.LookupIPv4(domain)
 	case dnsmessage.TypeAAAA:
 		ips, err = h.ipv6Lookup.LookupIPv6(domain)
+	}
+	if d := time.Since(lookupAt); d >= 300*time.Millisecond || err != nil {
+		applog.LimitedPrintf("dns:"+qType.String()+":"+domain, "dns %s %s 用时 %s ips=%d err=%v", domain, qType, d.Round(time.Millisecond), len(ips), err)
 	}
 
 	rcode := dns.RCodeFromError(err)
